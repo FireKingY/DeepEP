@@ -136,8 +136,9 @@ struct LowLatencyLayout {
     LowLatencyLayout(
         bool disable_ll_layered, void* rdma_buffer, int num_max_dispatch_tokens_per_rank, int hidden, int num_ranks, int num_experts) {
         const int num_scales = hidden / 128;
-        const int num_nodes = num_ranks / NUM_MAX_NVL_PEERS;  // TODO Automatically calculate the value of NUM_MAX_NVL_PEERS according to
-                                                              // the running situation of the process
+        // In layered low-latency dispatch, we treat each NVLink island as a "node" and only ship
+        // token payloads once per node to reduce cross-node RDMA duplication.
+        const int num_nodes = num_ranks / NUM_MAX_NVL_PEERS;  // TODO Automatically calculate NUM_MAX_NVL_PEERS at runtime
 
         // Dispatch and combine layout:
         //  - 2 symmetric odd/even send buffer
@@ -148,6 +149,9 @@ struct LowLatencyLayout {
         // NOTES: you should add a control `int4` for combine messages if you want to do data transformation
         // NOTES: `num_scales * sizeof(nv_bfloat162)` means the per-128-channel min/max
         EP_HOST_ASSERT(num_scales * sizeof(float) <= hidden);
+        // Layered dispatch splits each message into:
+        //  - meta: src token index + reserved int fields (per-expert, per-rank)
+        //  - data: token payload (per-node, de-duplicated across ranks in the same node)
         size_t per_meta_data_size = sizeof(int4);
         size_t per_token_size = std::max(hidden * sizeof(nv_bfloat16), hidden + num_scales * sizeof(float));
         size_t num_bytes_per_dispatch_msg = sizeof(int4) + std::max(hidden * sizeof(nv_bfloat16), hidden + num_scales * sizeof(float));
@@ -167,6 +171,7 @@ struct LowLatencyLayout {
         // TODO: optimize memory usages
         size_t dispatch_recv_data_buffer_bytes = num_experts * num_max_dispatch_tokens_per_rank * num_bytes_per_dispatch_msg;
         if (!disable_ll_layered) {
+            // Meta is still per-expert/per-rank, while token payloads are stored once per node.
             dispatch_recv_data_buffer_bytes = num_experts * num_max_dispatch_tokens_per_rank * per_meta_data_size +
                 num_nodes * num_max_dispatch_tokens_per_rank * per_token_size;  // means num_experts == local_experts * num_ranks
         }
@@ -176,6 +181,9 @@ struct LowLatencyLayout {
         total_bytes += recv_buffer_bytes * 2;
 
         // Symmetric signaling buffers
+        // dispatch_recv_count_buffer_bytes:
+        //  - per-expert recv count for dispatch/combine
+        //  - extra data-ready counters + a small send buffer for layered dispatch
         size_t dispatch_recv_count_buffer_bytes =
             num_experts * sizeof(int);  // means num_experts == local_experts * num_ranks == local_experts * NUM_MAX_NVL_PEERS * num_nodes,
                                         // Half is used in dispatch, and the other half is used in combine.
