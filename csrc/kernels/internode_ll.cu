@@ -170,13 +170,16 @@ __global__ __launch_bounds__(1024, 1) void dispatch(bool disable_ll_layered,
 
     const auto num_nvl_ranks = NUM_MAX_NVL_PEERS;
     const auto num_nodes = num_ranks / num_nvl_ranks;
+    // Layered dispatch uses extra signaling space after rdma_recv_count:
+    //   [num_experts counts] + [num_nodes * tokens * num_nvl_ranks data-ready flags] + [num_nvl_ranks staging ints].
     int* data_ready_counter = reinterpret_cast<int*>(rdma_recv_count + num_experts);
     int* next_clean_data_ready_counter = reinterpret_cast<int*>(next_clean + num_experts);
     auto* data_ready_send_buffer =
         reinterpret_cast<int*>(data_ready_counter) + num_nodes * num_max_dispatch_tokens_per_rank * num_nvl_ranks;
     if (!disable_ll_layered) {
         if (thread_id < num_nvl_ranks) {
-            st_na_global(reinterpret_cast<int*>(data_ready_send_buffer) + thread_id, 2);  // set to 2
+            // Ready flag value "2" is broadcast to remote nodes for data-ready notification.
+            st_na_global(reinterpret_cast<int*>(data_ready_send_buffer) + thread_id, 2);
         }
         __syncthreads();
         EP_DEVICE_ASSERT(num_ranks % num_nvl_ranks == 0);
@@ -195,12 +198,12 @@ __global__ __launch_bounds__(1024, 1) void dispatch(bool disable_ll_layered,
 
     // Message package: index at source (int), 3 reserved int fields, hidden data, FP8 scales
     // NOTES: currently we have 3 reserved int fields for future use
-    // old code, not open dispatch opt {
+    // Legacy layout (non-layered): meta + payload stored together per rank.
     using vec_t = std::conditional_t<kUseFP8, int2, int4>;
     const size_t num_bytes_per_msg = sizeof(int4) + (kUseFP8 ? (kHidden + num_scales * sizeof(float)) : (kHidden * sizeof(nv_bfloat16)));
     const size_t num_int4_per_msg = num_bytes_per_msg / sizeof(int4);
     EP_DEVICE_ASSERT(num_bytes_per_msg % sizeof(int4) == 0);
-    // } open dispatch opt {
+    // Layered layout: meta and payload are split; payload is stored per-node to avoid duplicate RDMA traffic.
     const size_t num_bytes_per_meta = sizeof(int4);
     const size_t num_bytes_per_data = (kUseFP8 ? (kHidden + num_scales * sizeof(float)) : (kHidden * sizeof(nv_bfloat16)));
     const size_t num_bytes_per_msg_new = num_bytes_per_meta + num_bytes_per_data;
@@ -288,8 +291,8 @@ __global__ __launch_bounds__(1024, 1) void dispatch(bool disable_ll_layered,
                 slot_idx = __shfl_sync(0xffffffff, slot_idx, 0);
                 const auto dst_rank = dst_expert_idx / num_local_experts;
                 const auto dst_expert_local_idx = dst_expert_idx % num_local_experts;
-                auto real_write_dst_rank = dst_rank / num_nvl_ranks * num_nvl_ranks +
-                    rank % num_nvl_ranks;  // send data to same gpu_device_id_rank(same-rail rdma traffic)
+                // Map to the same GPU index on the destination node to keep same-rail RDMA traffic.
+                auto real_write_dst_rank = dst_rank / num_nvl_ranks * num_nvl_ranks + rank % num_nvl_ranks;
                 auto real_dst_expert_id = real_write_dst_rank * num_local_experts + dst_expert_local_idx;
                 if (!disable_ll_layered) {
                     if (not is_rank_masked<true>(mask_buffer_ptr, real_write_dst_rank)) {  // send token
@@ -308,7 +311,7 @@ __global__ __launch_bounds__(1024, 1) void dispatch(bool disable_ll_layered,
                             }
                         }
 
-                        if (send_node_id != -1) {  // send token
+                        if (send_node_id != -1) {  // send token payload once per node
                             const auto src_ptr = reinterpret_cast<uint64_t>(rdma_x_src_idx) + num_bytes_per_meta;
                             const auto dst_ptr = reinterpret_cast<uint64_t>(rdma_recv_x_data) +
                                 (rank / num_nvl_ranks) * num_max_dispatch_tokens_per_rank * num_bytes_per_data +
@@ -325,7 +328,7 @@ __global__ __launch_bounds__(1024, 1) void dispatch(bool disable_ll_layered,
                                     7, lane_id, num_bytes_per_data / sizeof(int4), dst_int4_ptr, src_int4_ptr, ld_nc_global, st_na_global);
                             }
                         }
-                        if (send_node_id != -1) {  // send data ready flag
+                        if (send_node_id != -1) {  // send data-ready flags for all NVL ranks on that node
                             const auto src_ptr = reinterpret_cast<uint64_t>(data_ready_send_buffer);
                             const auto data_ready_counter_ptr = reinterpret_cast<uint64_t>(data_ready_counter) +
                                 (rank / num_nvl_ranks) * num_max_dispatch_tokens_per_rank * num_nvl_ranks * sizeof(int) +
@@ -346,7 +349,7 @@ __global__ __launch_bounds__(1024, 1) void dispatch(bool disable_ll_layered,
                             }
                         }
                     }
-                    // send meta
+                    // Send meta to the exact destination rank (per-expert/per-rank).
                     const auto src_ptr = reinterpret_cast<uint64_t>(rdma_x_src_idx);
                     const auto dst_ptr = reinterpret_cast<uint64_t>(rdma_recv_x_meta) +
                         dst_expert_local_idx * num_ranks * num_max_dispatch_tokens_per_rank * num_bytes_per_meta +
@@ -366,6 +369,7 @@ __global__ __launch_bounds__(1024, 1) void dispatch(bool disable_ll_layered,
                     }
                 }
                 if (disable_ll_layered) {
+                    // Legacy path: send meta+payload together to every destination rank.
                     const auto src_ptr = reinterpret_cast<uint64_t>(rdma_x_src_idx);
                     const auto dst_ptr = reinterpret_cast<uint64_t>(rdma_recv_x) +
                         dst_expert_local_idx * num_ranks * num_max_dispatch_tokens_per_rank * num_bytes_per_msg +
@@ -387,6 +391,7 @@ __global__ __launch_bounds__(1024, 1) void dispatch(bool disable_ll_layered,
                 __syncwarp();
                 lane_id == 0 ? atomic_add_release_global(atomic_finish_counter_per_expert + dst_expert_idx, 1) : 0;
                 if (!disable_ll_layered) {
+                    // Also count the "real" destination rank used for per-node payload.
                     lane_id == 0 ? atomic_add_release_global(atomic_finish_counter_per_expert + real_dst_expert_id, 1) : 0;
                 }
             }
@@ -411,6 +416,8 @@ __global__ __launch_bounds__(1024, 1) void dispatch(bool disable_ll_layered,
         }
 
         // This SM should be responsible for some destination experts, read `topk_idx` for them
+        // expert_count: number of tokens targeting each expert in this SM's range.
+        // waiting_flag: layered mode adjusts for payloads sent only once per node.
         int expert_count[kNumMaxWarpGroups] = {0};
         int waiting_flag[kNumMaxWarpGroups] = {0};
         const auto expert_begin_idx = sm_id * num_warp_groups;
@@ -422,7 +429,7 @@ __global__ __launch_bounds__(1024, 1) void dispatch(bool disable_ll_layered,
             auto idx = static_cast<int>(__ldg(topk_idx + i));
             if (idx >= expert_begin_idx and idx < expert_end_idx)
                 expert_count[idx - expert_begin_idx]++;
-            if (!disable_ll_layered) {  // only open ll dispatch opt, should do
+            if (!disable_ll_layered) {  // layered dispatch: account for per-node payload destinations
                 if (idx < 0)
                     continue;
                 const auto dst_rank = idx / num_local_experts;
@@ -444,6 +451,7 @@ __global__ __launch_bounds__(1024, 1) void dispatch(bool disable_ll_layered,
             }
             if (lane_id == 0) {
                 shared_num_tokens_sent_per_expert[i - expert_begin_idx] = sum;
+                // In layered mode, subtract per-node payload counts to avoid waiting twice.
                 atomic_add_release_global(atomic_finish_counter_per_expert + i, FINISHED_SUM_TAG - waiting_flag_sum - sum);
             }
         }
@@ -523,11 +531,13 @@ LOW_LATENCY_DISPATCH_RECV:
         const auto local_expert_idx = responsible_expert_idx % num_local_experts;
         uint8_t* rdma_recv_x_uint8 = nullptr;
         if (disable_ll_layered) {
+            // Legacy layout: meta+payload are contiguous per (expert, rank, slot).
             rdma_recv_x_uint8 = static_cast<uint8_t*>(rdma_recv_x) +
                 local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank * num_bytes_per_msg +
                 src_rank * num_max_dispatch_tokens_per_rank * num_bytes_per_msg;
         }
         if (!disable_ll_layered) {
+            // Layered layout: meta is per-rank; payload is stored per-node.
             rdma_recv_x_uint8 = static_cast<uint8_t*>(rdma_recv_x_meta) +
                 local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank * num_bytes_per_meta +
                 src_rank * num_max_dispatch_tokens_per_rank * num_bytes_per_meta;
@@ -586,6 +596,7 @@ LOW_LATENCY_DISPATCH_RECV:
         asm volatile("bar.sync %0, %1;" ::"r"(warp_group_id + 2), "r"(num_warps_per_group * 32));
         num_recv_tokens = shared_num_recv_tokens[warp_group_id];
         recv_token_begin_idx = shared_recv_token_begin_idx[warp_group_id];
+        // Read payload from the "real" writer rank within the source node.
         const auto real_read_src_rank = src_rank % num_nvl_ranks + rank / num_nvl_ranks * num_nvl_ranks;
 
         // Copy tokens
@@ -598,6 +609,7 @@ LOW_LATENCY_DISPATCH_RECV:
                 int src_token_idx = 0;
                 if (lane_id == 0) {
                     src_token_idx = ld_nc_global(src_src_idx);
+                    // Pack (src_token_idx, src_rank) into int64 for combine.
                     recv_src_info[recv_token_begin_idx + i] = pack2<int, int64_t>(src_token_idx, src_rank);
                 }
                 src_token_idx = __shfl_sync(0xffffffff, src_token_idx, 0);
@@ -609,7 +621,7 @@ LOW_LATENCY_DISPATCH_RECV:
                 if (lane_id == 0) {
                     int tmp = 0;
                     auto start_time = clock64();
-                    while (tmp != 2) {  // wait for data to be ready
+                    while (tmp != 2) {  // wait for data-ready flag
                         tmp = ld_acquire_sys_global(src_data_ready_flag_p2p_ptr);
                         if (clock64() - start_time >= NUM_TIMEOUT_CYCLES) {
                             printf(
@@ -992,20 +1004,21 @@ __global__ __launch_bounds__(1024, 1) void combine(bool disable_ll_layered,
 
     // Parameters for IBGDA sends outer loop, declared upfront to bypass goto initialization restrictions.
     int initial_idx, loop_bound, step_size;
-    // Shared between warps in sms for overlap mode, where each sm only has one warp group
+    // Shared between warps in sms for overlap mode, where each sm only has one warp group.
+    // Prefix sum is placed after the send-phase smem area.
     auto shared_vaild_signal_prefix_sum = reinterpret_cast<int*>(smem_buffer + smem_send_size);
 
     // Sending phase
     if ((phases & LOW_LATENCY_SEND_PHASE) == 0)
         goto LOW_LATENCY_COMBINE_RECV;
 
-    // Clean up next buffer
+    // Clean up next buffer. Layered dispatch also clears data-ready flags.
     if (!disable_ll_layered and sm_id == num_sms - 1) {
         #pragma unroll
         for (int i = thread_id; i < num_experts; i += num_threads)
             next_clean[i] = 0;
 
-        // clean data ready flag
+        // Clean data-ready flags for layered dispatch.
         #pragma unroll 8
         for (int i = thread_id; i < num_max_dispatch_tokens_per_rank * num_ranks; i += num_threads) {
             int token_idx = i / num_ranks;
@@ -1042,7 +1055,9 @@ __global__ __launch_bounds__(1024, 1) void combine(bool disable_ll_layered,
 
     __shared__ int shared_vaild_signal_sum, shared_local_expert_idx;
 
-    // Compute prefix sums of valid signal counts per local expert
+    // Compute prefix sums of valid signal counts per local expert.
+    // Each comp_signal element represents a block of block_m tokens, so the prefix sum
+    // maps a global signal index to (local_expert_idx, block_idx).
     if (overlap) {
         if (sub_warp_id == 0 and lane_id == 0) {
             shared_vaild_signal_prefix_sum[0] = (packed_recv_count[0] == 0 ? 1 : ceil_div(packed_recv_count[0], block_m));
@@ -1057,7 +1072,9 @@ __global__ __launch_bounds__(1024, 1) void combine(bool disable_ll_layered,
         __syncthreads();
     }
 
-    // Issue IBGDA sends, non-overlap mode only loops once
+    // Issue IBGDA sends:
+    //   - overlap: iterate over signal blocks (block_m tokens) across SMs.
+    //   - non-overlap: each warp group handles a single expert.
     initial_idx = overlap ? sm_id : responsible_expert_idx;
     loop_bound = overlap ? shared_vaild_signal_sum : num_experts;
     step_size = overlap ? num_sms : num_experts;
@@ -1085,7 +1102,7 @@ __global__ __launch_bounds__(1024, 1) void combine(bool disable_ll_layered,
         int offset, num_tokens_to_send;
         unpack2(layout, num_tokens_to_send, offset);
 
-        // Wait the corresponding comp_signal to reach the threshold
+        // Wait the corresponding comp_signal to reach the threshold.
         int num_tokens_per_expert, num_signal_per_expert, local_expert_signal_idx;
         const int* gemm_comp_signal;
         if (overlap) {
@@ -1237,7 +1254,8 @@ __global__ __launch_bounds__(1024, 1) void combine(bool disable_ll_layered,
         };
 
         if (overlap) {
-            // Put the finishing flag for overlap mode
+            // Put the finishing flag for overlap mode.
+            // Only send once all blocks for this local expert have been issued.
             bool put_finish_flag = false;
             if (sub_warp_id == 0) {
                 if (lane_id == 0) {
@@ -1509,6 +1527,7 @@ void combine(bool disable_ll_layered,
     int num_warp_groups, num_warps_per_group, num_recv_per_sm, num_warps;
 
     if (overlap == true and phases == LOW_LATENCY_SEND_PHASE) {
+        // Overlap send-only phase: one warp group per SM, and num_sms is user-tunable.
         num_warp_groups = 1;
         num_warps_per_group = 32;
         num_recv_per_sm = ceil_div(num_combined_tokens, num_device_sms);
@@ -1544,7 +1563,7 @@ void combine(bool disable_ll_layered,
     const int num_send_tma_bytes = 32 * sizeof(int4) * kNumMaxUnrolls + 16;
     const int smem_send_size = num_warps * (kNumStages * num_send_tma_bytes + num_meta_bytes);
 
-    // prefix_sum size, used for shared_vaild_signal_prefix_sum
+    // prefix_sum size, used for shared_vaild_signal_prefix_sum in overlap mode.
     const int num_local_experts = num_experts / num_ranks;
     const int smem_prefix_sum_size = num_local_experts * sizeof(int);
 

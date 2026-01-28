@@ -70,6 +70,8 @@ private:
 
     // Shrink mode buffer
     bool enable_shrink = false;
+    // true -> use legacy (non-layered) low-latency dispatch layout/behavior.
+    // false -> enable layered dispatch: meta per-rank, data per-node + data-ready counters.
     bool _disable_ll_layered = false;
     int* mask_buffer_ptr = nullptr;
     int* sync_buffer_ptr = nullptr;
@@ -275,6 +277,7 @@ public:
                          bool async,
                          bool return_recv_hook);
 
+    // When overlap=true, the send phase polls comp_signal to overlap sending with downstream GEMM.
     std::tuple<torch::Tensor, std::optional<EventHandle>, std::optional<std::function<void()>>> low_latency_combine(
         const torch::Tensor& x,
         const torch::Tensor& topk_idx,

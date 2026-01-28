@@ -282,6 +282,8 @@ void clean_low_latency_buffer(int* clean_0,
                               int* sync_buffer,
                               cudaStream_t stream);
 
+// dispatch_ll_dispatch_opt == true => legacy (non-layered) dispatch layout.
+// dispatch_ll_dispatch_opt == false => layered dispatch (meta per-rank, data per-node).
 void dispatch(bool dispatch_ll_dispatch_opt,
               void* packed_recv_x,
               void* packed_recv_x_scales,
@@ -313,6 +315,7 @@ void dispatch(bool dispatch_ll_dispatch_opt,
               cudaStream_t stream,
               int phases);
 
+// overlap mode uses comp_signal to trigger per-block sends while GEMM is running.
 void combine(bool dispatch_ll_dispatch_opt,
              void* combined_x,
              void* rdma_recv_x,

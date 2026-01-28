@@ -1589,6 +1589,7 @@ Buffer::low_latency_dispatch(const torch::Tensor& x,
     // Allocate packed tensors
     auto packed_recv_x = torch::empty({num_local_experts, num_ranks * num_max_dispatch_tokens_per_rank, hidden},
                                       x.options().dtype(use_fp8 ? torch::kFloat8_e4m3fn : torch::kBFloat16));
+    // src_info packs (src_token_idx | src_rank) into int64 for the combine phase.
     auto packed_recv_src_info =
         torch::empty({num_local_experts, num_ranks * num_max_dispatch_tokens_per_rank}, torch::dtype(torch::kInt64).device(torch::kCUDA));
     auto packed_recv_layout_range = torch::empty({num_local_experts, num_ranks}, torch::dtype(torch::kInt64).device(torch::kCUDA));
@@ -1696,6 +1697,7 @@ std::tuple<torch::Tensor, std::optional<EventHandle>, std::optional<std::functio
     const std::optional<torch::Tensor>& out) {
 #ifndef DISABLE_NVSHMEM
     EP_HOST_ASSERT(low_latency_mode);
+    // Overlap mode launches send/recv in separate phases so the caller can interleave GEMM.
     EP_HOST_ASSERT((!overlap || return_recv_hook) and "Overlap mode requires return_recv_hook=True");
 
     // Tensor checks
@@ -1715,6 +1717,7 @@ std::tuple<torch::Tensor, std::optional<EventHandle>, std::optional<std::functio
     EP_HOST_ASSERT(layout_range.scalar_type() == torch::kInt64);
     EP_HOST_ASSERT(layout_range.size(0) == num_experts / num_ranks and layout_range.size(1) == num_ranks);
 
+    // comp_signal is a fixed-length array for CUDA Graph capture: per-expert blocks of size ceil_div(tokens, block_m).
     if (comp_signal.has_value()) {
         EP_HOST_ASSERT(comp_signal->dim() == 1 and comp_signal->is_contiguous());
         EP_HOST_ASSERT(comp_signal->scalar_type() == torch::kInt32);

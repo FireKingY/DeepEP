@@ -90,7 +90,8 @@ class Buffer:
         self.explicitly_destroy = explicitly_destroy
         self.enable_shrink = enable_shrink
         disable_ll_layered = Buffer.disable_ll_layered()
-        if not disable_ll_layered and enable_shrink:  # Currently, the layered algorithm for ll dispatch has been optimized, so the shrink mode is no longer supported.
+        # Layered low-latency dispatch currently does not support shrink-mode masking.
+        if not disable_ll_layered and enable_shrink:
             print("DeepEP [ERROR] not support shrink, disable it", flush=True)
             enable_shrink = False
         self.runtime = deep_ep_cpp.Buffer(self.rank, self.group_size, num_nvl_bytes, num_rdma_bytes, low_latency_mode, explicitly_destroy,
@@ -141,6 +142,11 @@ class Buffer:
 
     @staticmethod
     def disable_ll_layered() -> bool:
+        """
+        Whether to disable layered low-latency dispatch optimization.
+
+        Controlled by: DEEPEP_DISABLE_LL_DISPATCH_OPT=1
+        """
         disable_ll_layered = False
         if int(os.environ.get('DEEPEP_DISABLE_LL_DISPATCH_OPT', '0')) == 1:
             disable_ll_layered = True
@@ -667,6 +673,7 @@ class Buffer:
             return_recv_hook: return a receiving hook if set. If set, the kernel will just do the RDMA request issues,
                 but **without actually receiving the data**. You must call the received hook to make sure the data's arrival.
                 If you do not set this flag, the kernel will ensure the data's arrival.
+                Note: overlap=True requires return_recv_hook=True.
             out: the in-place output tensor, if set, the kernel will write the result to this tensor and return it directly.
             combine_wait_recv_cost_stats: a cumulative time spent waiting to receive each token tensor for statistics,
                 which should have shape `[num_ranks, num_ranks]` and be typed as `torch.int64`.
