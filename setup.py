@@ -16,10 +16,11 @@ def get_nvshmem_host_lib_name(base_dir):
 
 
 if __name__ == '__main__':
-    disable_nvshmem = False
+    # Force disable NVSHMEM for intranode-only build
+    disable_nvshmem = os.getenv('FORCE_DISABLE_NVSHMEM', '0') == '1'
     nvshmem_dir = os.getenv('NVSHMEM_DIR', None)
     nvshmem_host_lib = 'libnvshmem_host.so'
-    if nvshmem_dir is None:
+    if not disable_nvshmem and nvshmem_dir is None:
         try:
             nvshmem_dir = importlib.util.find_spec("nvidia.nvshmem").submodule_search_locations[0]
             nvshmem_host_lib = get_nvshmem_host_lib_name(nvshmem_dir)
@@ -29,7 +30,7 @@ if __name__ == '__main__':
                 'Warning: `NVSHMEM_DIR` is not specified, and the NVSHMEM module is not installed. All internode and low-latency features are disabled\n'
             )
             disable_nvshmem = True
-    else:
+    elif nvshmem_dir is not None:
         disable_nvshmem = False
 
     if not disable_nvshmem:
@@ -39,9 +40,9 @@ if __name__ == '__main__':
     nvcc_flags = ['-O3', '-Xcompiler', '-O3']
     sources = ['csrc/deep_ep.cpp', 'csrc/kernels/runtime.cu', 'csrc/kernels/layout.cu', 'csrc/kernels/intranode.cu']
     include_dirs = ['csrc/']
-    library_dirs = []
+    library_dirs = ['/usr/lib/x86_64-linux-gnu']
     nvcc_dlink = []
-    extra_link_args = ['-lcuda']
+    extra_link_args = ['-l:libcuda.so.1']
 
     # NVSHMEM flags
     if disable_nvshmem:
@@ -69,7 +70,9 @@ if __name__ == '__main__':
         os.environ['TORCH_CUDA_ARCH_LIST'] = os.getenv('TORCH_CUDA_ARCH_LIST', '9.0')
 
         # CUDA 12 flags
-        nvcc_flags.extend(['-rdc=true', '--ptxas-options=--register-usage-level=10'])
+        # Only use -rdc=true when NVSHMEM is enabled (needs device linking)
+        if not disable_nvshmem:
+            nvcc_flags.extend(['-rdc=true', '--ptxas-options=--register-usage-level=10'])
 
     # Disable LD/ST tricks, as some CUDA version does not support `.L1::no_allocate`
     if os.environ['TORCH_CUDA_ARCH_LIST'].strip() != '9.0':
