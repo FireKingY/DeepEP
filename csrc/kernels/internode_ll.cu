@@ -281,8 +281,9 @@ __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
     } else if (warp_id == num_warps - 1) {
         EP_DEVICE_ASSERT(num_sms > 1);
         if (sm_id == 0) {
-            // The first SM is also responsible for checking QPs
-            EP_DEVICE_ASSERT(ibgda_get_state()->num_rc_per_pe >= num_local_experts);
+            // Only check QP availability when IBGDA is initialized (multi-node)
+            if (ibgda_get_state()->num_devices_initialized > 0)
+                EP_DEVICE_ASSERT(ibgda_get_state()->num_rc_per_pe >= num_local_experts);
 
             // The first SM is also responsible for cleaning the next buffer
             #pragma unroll

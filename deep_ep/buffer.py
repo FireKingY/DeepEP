@@ -103,11 +103,14 @@ class Buffer:
         # Synchronize NVSHMEM unique IDs
         root_unique_id = None
         if self.runtime.get_num_rdma_ranks() > 1 or low_latency_mode:
-            # Enable IBGDA
-            assert num_qps_per_rank > 0
+            # Enable IBGDA only when there are actual RDMA ranks (multi-node)
             os.environ['NVSHMEM_DISABLE_P2P'] = '0' if allow_nvlink_for_low_latency_mode else '1'
-            os.environ['NVSHMEM_IB_ENABLE_IBGDA'] = '1'
-            os.environ['NVSHMEM_IBGDA_NUM_RC_PER_PE'] = f'{num_qps_per_rank}'
+            if self.runtime.get_num_rdma_ranks() > 1:
+                assert num_qps_per_rank > 0
+                os.environ['NVSHMEM_IB_ENABLE_IBGDA'] = '1'
+                os.environ['NVSHMEM_IBGDA_NUM_RC_PER_PE'] = f'{num_qps_per_rank}'
+            else:
+                os.environ['NVSHMEM_IB_ENABLE_IBGDA'] = '0'
 
             # Make sure QP depth is always larger than the number of on-flight WRs, so that we can skip WQ slot check
             self.nvshmem_qp_depth = int(os.environ.get('NVSHMEM_QP_DEPTH', '1024'))

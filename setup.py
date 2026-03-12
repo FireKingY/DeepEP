@@ -40,6 +40,12 @@ if __name__ == '__main__':
     nvcc_flags = ['-O3', '-Xcompiler', '-O3']
     sources = ['csrc/deep_ep.cpp', 'csrc/kernels/runtime.cu', 'csrc/kernels/layout.cu', 'csrc/kernels/intranode.cu']
     include_dirs = ['csrc/']
+
+    # CUDA 13+ moved CCCL headers to a subdirectory; add it if present
+    cuda_home = os.environ.get('CUDA_HOME', '/usr/local/cuda')
+    cccl_include = os.path.join(cuda_home, 'targets', 'x86_64-linux', 'include', 'cccl')
+    if os.path.isdir(cccl_include):
+        include_dirs.append(cccl_include)
     library_dirs = ['/usr/lib/x86_64-linux-gnu']
     nvcc_dlink = []
     extra_link_args = ['-l:libcuda.so.1']
