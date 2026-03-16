@@ -689,6 +689,7 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
             num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * sizeof(float) * num_scales        // FP8 scale buffer
         <= num_nvl_bytes);
     last_dispatch_grid_size = config.num_sms;
+    last_dispatch_was_direct_write = false;
     intranode::dispatch(recv_x.data_ptr(),
                         recv_x_scales_ptr,
                         recv_src_idx.data_ptr<int>(),
@@ -864,7 +865,7 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
         static_cast<int64_t>(num_channels) * num_ranks * config.num_max_nvl_chunked_recv_tokens * sizeof(int) +
         static_cast<int64_t>(num_channels) * num_ranks * config.num_max_nvl_chunked_recv_tokens * num_topk * sizeof(float);
     EP_HOST_ASSERT(combine_scratch_bytes <= num_nvl_bytes);
-    if (direct_write_registered) {
+    if (last_dispatch_was_direct_write) {
         EP_HOST_ASSERT(combine_scratch_bytes <= dw_recv_x_offset &&
             "Combine scratch overlaps direct-write Region B. Use a matching config or re-register.");
     }
@@ -1144,6 +1145,7 @@ Buffer::intranode_dispatch_direct_write(const torch::Tensor& x,
 
     // Launch direct-write dispatch kernel (includes cross-rank barrier at the end)
     last_dispatch_grid_size = num_channels;  // sender-only: num_sms / 2
+    last_dispatch_was_direct_write = true;
     intranode::dispatch_direct_write(
         send_head.data_ptr<int>(),
         x.data_ptr(),

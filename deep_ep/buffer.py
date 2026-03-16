@@ -178,6 +178,8 @@ class Buffer:
 
     def _direct_write_layout_matches(self, x, topk_idx, num_worst_tokens, config) -> bool:
         """Check if the current dispatch parameters match the registered direct-write layout."""
+        if config.num_sms % 2 != 0:
+            return False  # Odd num_sms is invalid for dispatch/combine
         dw_worst, dw_hidden, dw_topk, dw_elem, dw_ch, dw_recv = self.runtime.get_direct_write_layout()
         return (x.size(1) == dw_hidden
                 and x.element_size() == dw_elem
