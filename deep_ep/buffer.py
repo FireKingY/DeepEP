@@ -149,6 +149,29 @@ class Buffer:
         self.runtime.destroy()
         self.runtime = None
 
+    def register_direct_write_layout(self, num_worst_tokens: int, hidden: int, num_topk: int,
+                                      num_scales: int = 0, elem_size: int = 2,
+                                      config=None) -> None:
+        """
+        Register a fixed output layout for direct-write dispatch (num_worst_tokens > 0 path).
+        Output tensors are allocated within the IPC buffer, eliminating the ring buffer copy.
+        Must be called before using direct-write dispatch.
+
+        Arguments:
+            num_worst_tokens: the worst-case number of tokens to receive.
+            hidden: the hidden dimension of each token.
+            num_topk: the number of top-k experts per token.
+            num_scales: the number of FP8 scales (0 for BF16).
+            elem_size: element size in bytes (2 for BF16, 1 for FP8).
+            config: optional config to determine num_channels (or use default).
+        """
+        num_channels = Buffer.num_sms // 2
+        self.runtime.register_direct_write_layout(num_worst_tokens, hidden, num_topk, num_scales, elem_size, num_channels)
+
+    def is_direct_write_registered(self) -> bool:
+        """Check if direct-write layout has been registered."""
+        return self.runtime.is_direct_write_registered()
+
     @staticmethod
     def is_sm90_compiled():
         return deep_ep_cpp.is_sm90_compiled()
@@ -391,6 +414,18 @@ class Buffer:
                 x, x_scales, None, None, None, is_token_in_rank, None, num_recv_tokens, rank_prefix_matrix, channel_prefix_matrix,
                 expert_alignment, num_worst_tokens, config, getattr(previous_event, 'event', None), async_finish, allocate_on_comm_stream)
             return (recv_x, recv_x_scales) if x_scales is not None else recv_x, None, None, None, None, EventOverlap(event)
+        elif num_worst_tokens > 0 and self.runtime.is_direct_write_registered() and topk_idx is not None:
+            # Direct-write path: sender writes directly to receiver's IPC buffer
+            assert num_tokens_per_rank is not None and is_token_in_rank is not None and num_tokens_per_expert is not None
+            recv_x, recv_x_scales, recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert_list, rank_prefix_matrix, channel_prefix_matrix, recv_channel_prefix_matrix, recv_src_idx, send_head, event = \
+                self.runtime.intranode_dispatch_direct_write(x, x_scales, topk_idx, topk_weights,
+                                                             num_tokens_per_rank, is_token_in_rank, num_tokens_per_expert,
+                                                             expert_alignment, num_worst_tokens, config,
+                                                             getattr(previous_event, 'event', None), async_finish, allocate_on_comm_stream)
+            handle = (rank_prefix_matrix, channel_prefix_matrix, recv_channel_prefix_matrix, recv_src_idx, is_token_in_rank, send_head)
+            return (
+                recv_x, recv_x_scales
+            ) if x_scales is not None else recv_x, recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert_list, handle, EventOverlap(event)
         else:
             assert num_tokens_per_rank is not None and is_token_in_rank is not None and num_tokens_per_expert is not None
             recv_x, recv_x_scales, recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert_list, rank_prefix_matrix, channel_prefix_matrix, recv_channel_prefix_matrix, recv_src_idx, send_head, event = \

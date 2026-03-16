@@ -112,6 +112,21 @@ private:
 
     shared_memory::SharedMemoryAllocator shared_memory_allocator;
 
+    // Direct-write dispatch layout (registered once, reused)
+    bool direct_write_registered = false;
+    int dw_num_worst_tokens = 0;
+    int dw_hidden = 0;
+    int dw_num_topk = 0;
+    int dw_num_scales = 0;
+    int dw_elem_size = 0;  // element size of x (1 for FP8, 2 for BF16)
+    int64_t dw_recv_x_offset = 0;
+    int64_t dw_recv_topk_idx_offset = 0;
+    int64_t dw_recv_topk_weights_offset = 0;
+    int64_t dw_recv_src_idx_offset = 0;
+    int64_t dw_recv_x_scales_offset = 0;
+    int64_t dw_recv_channel_offset_offset = 0;
+    int64_t dw_region_b_size = 0;  // total bytes for Region B
+
 public:
     Buffer(int rank,
            int num_ranks,
@@ -251,6 +266,35 @@ public:
         std::optional<EventHandle>& previous_event,
         bool async,
         bool allocate_on_comm_stream);
+
+    void register_direct_write_layout(int num_worst_tokens, int hidden, int num_topk, int num_scales, int elem_size, int num_channels);
+
+    bool is_direct_write_registered() const;
+
+    std::tuple<torch::Tensor,
+               std::optional<torch::Tensor>,
+               std::optional<torch::Tensor>,
+               std::optional<torch::Tensor>,
+               std::vector<int>,
+               torch::Tensor,
+               torch::Tensor,
+               torch::Tensor,
+               torch::Tensor,
+               torch::Tensor,
+               std::optional<EventHandle>>
+    intranode_dispatch_direct_write(const torch::Tensor& x,
+                                    const std::optional<torch::Tensor>& x_scales,
+                                    const std::optional<torch::Tensor>& topk_idx,
+                                    const std::optional<torch::Tensor>& topk_weights,
+                                    const std::optional<torch::Tensor>& num_tokens_per_rank,
+                                    const torch::Tensor& is_token_in_rank,
+                                    const std::optional<torch::Tensor>& num_tokens_per_expert,
+                                    int expert_alignment,
+                                    int num_worst_tokens,
+                                    const Config& config,
+                                    std::optional<EventHandle>& previous_event,
+                                    bool async,
+                                    bool allocate_on_comm_stream);
 
     void clean_low_latency_buffer(int num_max_dispatch_tokens_per_rank, int hidden, int num_experts);
 

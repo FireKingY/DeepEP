@@ -910,6 +910,274 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
     return {recv_x, recv_topk_weights, event};
 }
 
+void Buffer::register_direct_write_layout(int num_worst_tokens, int hidden, int num_topk, int num_scales, int elem_size, int num_channels) {
+    EP_HOST_ASSERT(num_worst_tokens > 0);
+    EP_HOST_ASSERT(hidden > 0);
+    EP_HOST_ASSERT(elem_size == 1 or elem_size == 2);  // FP8 or BF16
+    EP_HOST_ASSERT(num_channels > 0);
+
+    int hidden_int4 = hidden * elem_size / sizeof(int4);
+    EP_HOST_ASSERT(hidden_int4 > 0);
+
+    // Compute Region B layout: all output tensors packed sequentially
+    // Region A is: rank_prefix_matrix (num_ranks * num_ranks * sizeof(int))
+    //            + expert metadata (num_ranks * num_local_experts * sizeof(int))
+    // We place Region B after the maximum possible Region A size
+    int64_t region_a_size = num_ranks * num_ranks * sizeof(int) + num_ranks * NUM_MAX_LOCAL_EXPERTS * sizeof(int);
+    // Align to 128 bytes
+    region_a_size = (region_a_size + NUM_BUFFER_ALIGNMENT_BYTES - 1) / NUM_BUFFER_ALIGNMENT_BYTES * NUM_BUFFER_ALIGNMENT_BYTES;
+
+    int64_t offset = region_a_size;
+
+    dw_recv_x_offset = offset;
+    offset += static_cast<int64_t>(num_worst_tokens) * hidden * elem_size;
+    offset = (offset + NUM_BUFFER_ALIGNMENT_BYTES - 1) / NUM_BUFFER_ALIGNMENT_BYTES * NUM_BUFFER_ALIGNMENT_BYTES;
+
+    dw_recv_topk_idx_offset = offset;
+    offset += static_cast<int64_t>(num_worst_tokens) * num_topk * sizeof(topk_idx_t);
+    offset = (offset + NUM_BUFFER_ALIGNMENT_BYTES - 1) / NUM_BUFFER_ALIGNMENT_BYTES * NUM_BUFFER_ALIGNMENT_BYTES;
+
+    dw_recv_topk_weights_offset = offset;
+    offset += static_cast<int64_t>(num_worst_tokens) * num_topk * sizeof(float);
+    offset = (offset + NUM_BUFFER_ALIGNMENT_BYTES - 1) / NUM_BUFFER_ALIGNMENT_BYTES * NUM_BUFFER_ALIGNMENT_BYTES;
+
+    dw_recv_src_idx_offset = offset;
+    offset += static_cast<int64_t>(num_worst_tokens) * sizeof(int);
+    offset = (offset + NUM_BUFFER_ALIGNMENT_BYTES - 1) / NUM_BUFFER_ALIGNMENT_BYTES * NUM_BUFFER_ALIGNMENT_BYTES;
+
+    dw_recv_x_scales_offset = offset;
+    offset += static_cast<int64_t>(num_worst_tokens) * num_scales * sizeof(float);
+    offset = (offset + NUM_BUFFER_ALIGNMENT_BYTES - 1) / NUM_BUFFER_ALIGNMENT_BYTES * NUM_BUFFER_ALIGNMENT_BYTES;
+
+    dw_recv_channel_offset_offset = offset;
+    offset += static_cast<int64_t>(num_ranks) * num_channels * sizeof(int);
+    offset = (offset + NUM_BUFFER_ALIGNMENT_BYTES - 1) / NUM_BUFFER_ALIGNMENT_BYTES * NUM_BUFFER_ALIGNMENT_BYTES;
+
+    dw_region_b_size = offset - region_a_size;
+
+    // Validate that Region B fits within num_nvl_bytes
+    // Region C (combine scratch) also needs to fit. Combine uses the same buffer for its ring queues.
+    // For safety, just check that Region B doesn't exceed total buffer size.
+    EP_HOST_ASSERT(offset <= num_nvl_bytes && "IPC buffer too small for direct-write layout. Increase num_nvl_bytes.");
+
+    dw_num_worst_tokens = num_worst_tokens;
+    dw_hidden = hidden;
+    dw_num_topk = num_topk;
+    dw_num_scales = num_scales;
+    dw_elem_size = elem_size;
+    direct_write_registered = true;
+}
+
+bool Buffer::is_direct_write_registered() const {
+    return direct_write_registered;
+}
+
+std::tuple<torch::Tensor,
+           std::optional<torch::Tensor>,
+           std::optional<torch::Tensor>,
+           std::optional<torch::Tensor>,
+           std::vector<int>,
+           torch::Tensor,
+           torch::Tensor,
+           torch::Tensor,
+           torch::Tensor,
+           torch::Tensor,
+           std::optional<EventHandle>>
+Buffer::intranode_dispatch_direct_write(const torch::Tensor& x,
+                                         const std::optional<torch::Tensor>& x_scales,
+                                         const std::optional<torch::Tensor>& topk_idx,
+                                         const std::optional<torch::Tensor>& topk_weights,
+                                         const std::optional<torch::Tensor>& num_tokens_per_rank,
+                                         const torch::Tensor& is_token_in_rank,
+                                         const std::optional<torch::Tensor>& num_tokens_per_expert,
+                                         int expert_alignment,
+                                         int num_worst_tokens,
+                                         const Config& config,
+                                         std::optional<EventHandle>& previous_event,
+                                         bool async,
+                                         bool allocate_on_comm_stream) {
+    EP_HOST_ASSERT(direct_write_registered);
+    EP_HOST_ASSERT(num_worst_tokens > 0);
+    EP_HOST_ASSERT(num_worst_tokens == dw_num_worst_tokens);
+
+    int num_channels = config.num_sms / 2;
+    EP_HOST_ASSERT(num_channels > 0);
+    EP_HOST_ASSERT(num_tokens_per_rank.has_value());
+    EP_HOST_ASSERT(num_tokens_per_expert.has_value());
+
+    // Type checks
+    EP_HOST_ASSERT(is_token_in_rank.scalar_type() == torch::kBool);
+    EP_HOST_ASSERT(num_tokens_per_expert->scalar_type() == torch::kInt32);
+    EP_HOST_ASSERT(num_tokens_per_rank->scalar_type() == torch::kInt32);
+
+    // Shape and contiguous checks
+    EP_HOST_ASSERT(x.dim() == 2 and x.is_contiguous());
+    EP_HOST_ASSERT((x.size(1) * x.element_size()) % sizeof(int4) == 0);
+    EP_HOST_ASSERT(is_token_in_rank.dim() == 2 and is_token_in_rank.is_contiguous());
+    EP_HOST_ASSERT(is_token_in_rank.size(0) == x.size(0) and is_token_in_rank.size(1) == num_ranks);
+
+    auto num_tokens = static_cast<int>(x.size(0)), hidden = static_cast<int>(x.size(1));
+    auto num_experts = static_cast<int>(num_tokens_per_expert->size(0));
+    EP_HOST_ASSERT(hidden == dw_hidden);
+    EP_HOST_ASSERT(x.element_size() == dw_elem_size);
+
+    // Top-k checks
+    int num_topk = 0;
+    topk_idx_t* topk_idx_ptr = nullptr;
+    float* topk_weights_ptr = nullptr;
+    EP_HOST_ASSERT(topk_idx.has_value() == topk_weights.has_value());
+    EP_HOST_ASSERT(topk_idx.has_value());  // Direct-write requires topk
+    if (topk_idx.has_value()) {
+        num_topk = static_cast<int>(topk_idx->size(1));
+        EP_HOST_ASSERT(num_topk == dw_num_topk);
+        EP_HOST_ASSERT(topk_idx->dim() == 2 and topk_idx->is_contiguous());
+        EP_HOST_ASSERT(topk_weights->dim() == 2 and topk_weights->is_contiguous());
+        topk_idx_ptr = topk_idx->data_ptr<topk_idx_t>();
+        topk_weights_ptr = topk_weights->data_ptr<float>();
+    }
+
+    // FP8 scales checks
+    float* x_scales_ptr = nullptr;
+    int num_scales = 0, scale_token_stride = 0, scale_hidden_stride = 0;
+    if (x_scales.has_value()) {
+        EP_HOST_ASSERT(x.element_size() == 1);
+        EP_HOST_ASSERT(x_scales->scalar_type() == torch::kFloat32 or x_scales->scalar_type() == torch::kInt);
+        EP_HOST_ASSERT(x_scales->dim() == 2);
+        num_scales = x_scales->dim() == 1 ? 1 : static_cast<int>(x_scales->size(1));
+        x_scales_ptr = static_cast<float*>(x_scales->data_ptr());
+        scale_token_stride = static_cast<int>(x_scales->stride(0));
+        scale_hidden_stride = static_cast<int>(x_scales->stride(1));
+    }
+
+    // Stream setup
+    auto compute_stream = at::cuda::getCurrentCUDAStream();
+    if (allocate_on_comm_stream) {
+        EP_HOST_ASSERT(previous_event.has_value() and async);
+        at::cuda::setCurrentCUDAStream(comm_stream);
+    }
+    if (previous_event.has_value()) {
+        stream_wait(comm_stream, previous_event.value());
+    } else {
+        stream_wait(comm_stream, compute_stream);
+    }
+
+    // Send sizes via notify_dispatch (same as standard path)
+    int num_recv_tokens = num_worst_tokens;  // Always use worst case
+    auto rank_prefix_matrix = torch::empty({num_ranks, num_ranks}, torch::dtype(torch::kInt32).device(torch::kCUDA));
+    auto channel_prefix_matrix = torch::empty({num_ranks, num_channels}, torch::dtype(torch::kInt32).device(torch::kCUDA));
+
+    int num_local_experts = num_experts / num_ranks;
+    int num_memset_int = 0;  // No ring buffer metadata to clear for direct-write
+
+    *moe_recv_counter = -1;
+    for (int i = 0; i < num_local_experts; ++i)
+        moe_recv_expert_counter[i] = -1;
+    EP_HOST_ASSERT(num_ranks * (num_ranks + num_local_experts) * sizeof(int) <= num_nvl_bytes);
+    intranode::notify_dispatch(num_tokens_per_rank->data_ptr<int>(),
+                               moe_recv_counter_mapped,
+                               num_ranks,
+                               num_tokens_per_expert->data_ptr<int>(),
+                               moe_recv_expert_counter_mapped,
+                               num_experts,
+                               num_tokens,
+                               is_token_in_rank.data_ptr<bool>(),
+                               channel_prefix_matrix.data_ptr<int>(),
+                               rank_prefix_matrix.data_ptr<int>(),
+                               num_memset_int,
+                               expert_alignment,
+                               buffer_ptrs_gpu,
+                               barrier_signal_ptrs_gpu,
+                               rank,
+                               comm_stream,
+                               num_channels);
+
+    // Allocate local output tensors (send_head and recv_channel_prefix_matrix are regular tensors)
+    auto send_head = torch::empty({num_tokens, num_ranks}, torch::dtype(torch::kInt32).device(torch::kCUDA));
+    auto recv_channel_prefix_matrix = torch::empty({num_ranks, num_channels}, torch::dtype(torch::kInt32).device(torch::kCUDA));
+    auto recv_src_idx = torch::empty({num_recv_tokens}, torch::dtype(torch::kInt32).device(torch::kCUDA));
+
+    // Launch direct-write dispatch kernel
+    intranode::dispatch_direct_write(
+        recv_src_idx.data_ptr<int>(),
+        recv_channel_prefix_matrix.data_ptr<int>(),
+        send_head.data_ptr<int>(),
+        x.data_ptr(),
+        x_scales_ptr,
+        topk_idx_ptr,
+        topk_weights_ptr,
+        is_token_in_rank.data_ptr<bool>(),
+        channel_prefix_matrix.data_ptr<int>(),
+        num_tokens,
+        num_worst_tokens,
+        static_cast<int>(hidden * x.element_size() / sizeof(int4)),
+        num_topk,
+        num_experts,
+        num_scales,
+        scale_token_stride,
+        scale_hidden_stride,
+        buffer_ptrs_gpu,
+        barrier_signal_ptrs_gpu,
+        rank,
+        num_ranks,
+        comm_stream,
+        config.num_sms,
+        dw_recv_x_offset,
+        dw_recv_topk_idx_offset,
+        dw_recv_topk_weights_offset,
+        dw_recv_src_idx_offset,
+        dw_recv_x_scales_offset,
+        dw_recv_channel_offset_offset,
+        dw_elem_size);
+
+    // Create output tensor views from local IPC buffer
+    auto recv_x = torch::from_blob(
+        static_cast<uint8_t*>(buffer_ptrs[nvl_rank]) + dw_recv_x_offset,
+        {num_recv_tokens, hidden}, x.options());
+
+    auto recv_topk_idx = std::optional<torch::Tensor>();
+    auto recv_topk_weights_out = std::optional<torch::Tensor>();
+    auto recv_x_scales_out = std::optional<torch::Tensor>();
+
+    if (topk_idx.has_value()) {
+        recv_topk_idx = torch::from_blob(
+            static_cast<uint8_t*>(buffer_ptrs[nvl_rank]) + dw_recv_topk_idx_offset,
+            {num_recv_tokens, num_topk}, topk_idx->options());
+        recv_topk_weights_out = torch::from_blob(
+            static_cast<uint8_t*>(buffer_ptrs[nvl_rank]) + dw_recv_topk_weights_offset,
+            {num_recv_tokens, num_topk}, topk_weights->options());
+    }
+    if (x_scales.has_value()) {
+        recv_x_scales_out = torch::from_blob(
+            static_cast<uint8_t*>(buffer_ptrs[nvl_rank]) + dw_recv_x_scales_offset,
+            {num_recv_tokens, num_scales}, x_scales->options());
+    }
+
+    // Wait streams
+    std::optional<EventHandle> event;
+    if (async) {
+        event = EventHandle(comm_stream);
+        for (auto& t : {x, is_token_in_rank, rank_prefix_matrix, channel_prefix_matrix,
+                        recv_x, recv_src_idx, recv_channel_prefix_matrix, send_head}) {
+            t.record_stream(comm_stream);
+            if (allocate_on_comm_stream) t.record_stream(compute_stream);
+        }
+        for (auto& to : {x_scales, topk_idx, topk_weights, num_tokens_per_rank,
+                         num_tokens_per_expert, recv_topk_idx, recv_topk_weights_out, recv_x_scales_out}) {
+            to.has_value() ? to->record_stream(comm_stream) : void();
+            if (allocate_on_comm_stream) to.has_value() ? to->record_stream(compute_stream) : void();
+        }
+    } else {
+        stream_wait(compute_stream, comm_stream);
+    }
+
+    if (allocate_on_comm_stream) at::cuda::setCurrentCUDAStream(compute_stream);
+
+    // Return with empty num_recv_tokens_per_expert_list (same as standard num_worst_tokens path)
+    return {recv_x, recv_x_scales_out, recv_topk_idx, recv_topk_weights_out,
+            std::vector<int>(), rank_prefix_matrix, channel_prefix_matrix,
+            recv_channel_prefix_matrix, recv_src_idx, send_head, event};
+}
+
 std::tuple<torch::Tensor,
            std::optional<torch::Tensor>,
            std::optional<torch::Tensor>,
@@ -1888,6 +2156,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("destroy", &deep_ep::Buffer::destroy)
         .def("get_dispatch_layout", &deep_ep::Buffer::get_dispatch_layout)
         .def("intranode_dispatch", &deep_ep::Buffer::intranode_dispatch)
+        .def("intranode_dispatch_direct_write", &deep_ep::Buffer::intranode_dispatch_direct_write)
+        .def("register_direct_write_layout", &deep_ep::Buffer::register_direct_write_layout)
+        .def("is_direct_write_registered", &deep_ep::Buffer::is_direct_write_registered)
         .def("intranode_combine", &deep_ep::Buffer::intranode_combine)
         .def("internode_dispatch", &deep_ep::Buffer::internode_dispatch)
         .def("internode_combine", &deep_ep::Buffer::internode_combine)

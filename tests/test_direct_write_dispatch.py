@@ -1,0 +1,259 @@
+import argparse
+import torch
+import torch.distributed as dist
+
+# noinspection PyUnresolvedReferences
+import deep_ep
+from utils import init_dist, calc_diff, inplace_unique, per_token_cast_to_fp8, per_token_cast_back
+
+
+def test_main(num_sms: int, local_rank: int, num_ranks: int, rank: int, buffer: deep_ep.Buffer,
+              group: dist.ProcessGroup, num_tokens: int = 1024, hidden: int = 7168,
+              num_topk: int = 8, num_experts: int = 256):
+    assert num_experts % num_ranks == 0
+    if local_rank == 0:
+        print(f'[config] num_tokens={num_tokens}, hidden={hidden}, num_topk={num_topk}, num_experts={num_experts}', flush=True)
+
+    # Random data
+    x = torch.ones((num_tokens, hidden), dtype=torch.bfloat16, device='cuda') * rank
+    x_pure_rand = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
+    x_e4m3 = per_token_cast_to_fp8(x) if deep_ep.Buffer.is_sm90_compiled() else None
+    x_e4m3 = (x_e4m3[0], x_e4m3[1].T.contiguous().T) if x_e4m3 is not None else None
+    scores = torch.randn((num_tokens, num_experts), dtype=torch.float32, device='cuda').abs() + 1
+    topk_idx = torch.topk(scores, num_topk, dim=-1, largest=True, sorted=False)[1]
+    topk_idx = topk_idx.to(deep_ep.topk_idx_t)
+    topk_weights = torch.ones((num_tokens, num_topk), dtype=torch.float32, device='cuda') * rank
+    topk_weights_pure_rand = torch.randn((num_tokens, num_topk), dtype=torch.float32, device='cuda')
+    rank_idx = topk_idx // (num_experts // num_ranks)
+    rank_idx = rank_idx.to(torch.int64)
+    rank_idx.masked_fill_(topk_idx == -1, -1)
+    inplace_unique(rank_idx, num_ranks)
+
+    # Expert meta
+    num_tokens_per_expert = torch.zeros((num_experts, ), dtype=torch.int, device='cuda')
+    for i in range(num_experts):
+        num_tokens_per_expert[i] = (topk_idx == i).sum()
+    gbl_num_tokens_per_expert = num_tokens_per_expert.clone()
+    dist.all_reduce(gbl_num_tokens_per_expert, group=group)
+
+    # Rank layout meta
+    num_tokens_per_rank = torch.empty((num_ranks, ), dtype=torch.int, device='cuda')
+    token_idx_in_rank = torch.full((num_ranks, num_tokens), -1, dtype=torch.long, device='cuda')
+    for i in range(num_ranks):
+        num_tokens_per_rank[i] = (rank_idx == i).sum()
+        token_sel = (rank_idx == i).max(dim=-1)[0]
+        count = token_sel.sum().item()
+        tokens = torch.sort(token_sel.to(torch.int), descending=True)[1]
+        tokens[:count] = torch.sort(tokens[:count])[0]
+        token_idx_in_rank[i][tokens[:count]] = torch.arange(count, dtype=torch.long, device='cuda')
+    token_idx_in_rank = token_idx_in_rank.T.contiguous().to(torch.int)
+    is_token_in_rank = token_idx_in_rank >= 0
+    gbl_num_tokens_per_rank = num_tokens_per_rank.clone()
+    dist.all_reduce(gbl_num_tokens_per_rank, group=group)
+
+    # Config
+    nvl_buffer_size = 256
+    config = deep_ep.Config(num_sms, 8, nvl_buffer_size)
+    num_worst_tokens = num_tokens * num_ranks
+
+    # Register direct-write layout for BF16
+    num_scales_bf16 = 0
+    deep_ep.Buffer.set_num_sms(num_sms)
+    buffer.register_direct_write_layout(num_worst_tokens, hidden, num_topk, num_scales_bf16, 2)
+    assert buffer.is_direct_write_registered()
+
+    # Helper to check data pattern
+    def check_data(check_x, rank_prefix_matrix):
+        assert torch.allclose(check_x.amin(dim=1), check_x.amax(dim=1))
+        check_start = 0
+        for i in range(num_ranks):
+            check_end = rank_prefix_matrix[i][rank].item()
+            assert (check_x[check_start:check_end, :].int() - i).sum().item() == 0
+            check_start = check_end
+
+    # ========== BF16 Tests ==========
+    if local_rank == 0:
+        print('\n=== BF16 Direct-Write Dispatch Tests ===', flush=True)
+
+    for async_mode in (False, True):
+        for current_x in (x, x_pure_rand):
+            if local_rank == 0:
+                print(f'[testing] BF16 direct-write (async={async_mode}, rand={current_x is x_pure_rand}) ...', flush=True, end='')
+
+            # Standard dispatch (reference)
+            dispatch_args = {
+                'x': current_x, 'num_tokens_per_rank': num_tokens_per_rank,
+                'is_token_in_rank': is_token_in_rank, 'num_tokens_per_expert': num_tokens_per_expert,
+                'topk_idx': topk_idx, 'topk_weights': topk_weights if current_x is x else topk_weights_pure_rand,
+                'config': config, 'async_finish': async_mode,
+            }
+            ref_x, ref_topk_idx, ref_topk_weights, ref_expert_list, ref_handle, ref_event = buffer.dispatch(**dispatch_args)
+            ref_event.current_stream_wait() if async_mode else ()
+
+            # Direct-write dispatch
+            dispatch_args['num_worst_tokens'] = num_worst_tokens
+            dw_x, dw_topk_idx, dw_topk_weights, dw_expert_list, dw_handle, dw_event = buffer.dispatch(**dispatch_args)
+            dw_event.current_stream_wait() if async_mode else ()
+
+            # Verify results match
+            actual_recv = ref_x.size(0)
+            assert dw_x.size(0) == num_worst_tokens
+            assert dw_topk_idx.size(0) == num_worst_tokens
+            assert dw_topk_weights.size(0) == num_worst_tokens
+            assert len(dw_expert_list) == 0
+
+            assert torch.equal(ref_x, dw_x[:actual_recv]), f'recv_x mismatch'
+            assert torch.equal(ref_topk_idx, dw_topk_idx[:actual_recv]), f'recv_topk_idx mismatch'
+
+            # Check topk_weights for non-(-1) entries
+            ref_tw_clone = ref_topk_weights.clone() if ref_topk_weights is not None else None
+            if ref_tw_clone is not None:
+                assert torch.equal(ref_tw_clone, dw_topk_weights[:actual_recv]), f'recv_topk_weights mismatch'
+
+            # Tail padding check
+            assert torch.all(dw_topk_idx[actual_recv:] == -1).item(), f'Tail topk_idx not padded with -1'
+
+            if local_rank == 0:
+                print(' passed', flush=True)
+
+    # ========== Combine Compatibility Tests ==========
+    if local_rank == 0:
+        print('\n=== Combine Compatibility Tests ===', flush=True)
+
+    for current_x in (x, x_pure_rand):
+        if local_rank == 0:
+            print(f'[testing] Direct-write dispatch + standard combine (rand={current_x is x_pure_rand}) ...', flush=True, end='')
+
+        # Standard dispatch+combine as reference
+        dispatch_args = {
+            'x': current_x, 'num_tokens_per_rank': num_tokens_per_rank,
+            'is_token_in_rank': is_token_in_rank, 'num_tokens_per_expert': num_tokens_per_expert,
+            'topk_idx': topk_idx, 'topk_weights': topk_weights if current_x is x else topk_weights_pure_rand,
+            'config': config,
+        }
+        ref_recv_x, ref_topk_idx, ref_topk_weights, _, ref_handle, _ = buffer.dispatch(**dispatch_args)
+        ref_combined_x, ref_combined_tw, _ = buffer.combine(
+            x=ref_recv_x, handle=ref_handle,
+            topk_weights=ref_topk_weights, config=config)
+
+        # Direct-write dispatch then combine
+        dispatch_args['num_worst_tokens'] = num_worst_tokens
+        dw_recv_x, dw_topk_idx, dw_topk_weights, _, dw_handle, _ = buffer.dispatch(**dispatch_args)
+        actual_recv = ref_recv_x.size(0)
+
+        # Combine uses the actual received tokens, not the worst-case padded ones
+        # We need to slice the handle's src_idx to match
+        rank_pm, chan_pm, recv_chan_pm, src_idx, is_tir, send_hd = dw_handle
+        sliced_handle = (rank_pm, chan_pm, recv_chan_pm, src_idx[:actual_recv], is_tir, send_hd)
+        dw_combined_x, dw_combined_tw, _ = buffer.combine(
+            x=dw_recv_x[:actual_recv], handle=sliced_handle,
+            topk_weights=dw_topk_weights[:actual_recv], config=config)
+
+        # Verify combine results match
+        assert calc_diff(ref_combined_x.float(), dw_combined_x.float()) < 5e-6, \
+            f'Combine result mismatch: diff={calc_diff(ref_combined_x.float(), dw_combined_x.float())}'
+        if ref_combined_tw is not None:
+            assert calc_diff(ref_combined_tw, dw_combined_tw) < 1e-9, 'Combine topk_weights mismatch'
+
+        if local_rank == 0:
+            print(' passed', flush=True)
+
+    # ========== Repeated Cycle Tests ==========
+    if local_rank == 0:
+        print('\n=== Repeated Dispatch/Combine Cycle Tests ===', flush=True)
+        print('[testing] 5 consecutive dispatch+combine cycles ...', flush=True, end='')
+
+    for cycle in range(5):
+        dispatch_args = {
+            'x': x, 'num_tokens_per_rank': num_tokens_per_rank,
+            'is_token_in_rank': is_token_in_rank, 'num_tokens_per_expert': num_tokens_per_expert,
+            'topk_idx': topk_idx, 'topk_weights': topk_weights,
+            'config': config, 'num_worst_tokens': num_worst_tokens,
+        }
+        dw_recv_x, dw_topk_idx, dw_topk_weights, _, dw_handle, _ = buffer.dispatch(**dispatch_args)
+        actual_recv = gbl_num_tokens_per_rank[rank].item()
+        rank_pm, chan_pm, recv_chan_pm, src_idx, is_tir, send_hd = dw_handle
+        sliced_handle = (rank_pm, chan_pm, recv_chan_pm, src_idx[:actual_recv], is_tir, send_hd)
+        dw_combined_x, _, _ = buffer.combine(
+            x=dw_recv_x[:actual_recv], handle=sliced_handle,
+            topk_weights=dw_topk_weights[:actual_recv], config=config)
+        check_x = dw_combined_x.float() / is_token_in_rank.sum(dim=1).unsqueeze(1)
+        assert calc_diff(check_x, x) < 5e-6, f'Cycle {cycle}: combine result mismatch'
+
+    if local_rank == 0:
+        print(' passed', flush=True)
+
+    # ========== FP8 Tests ==========
+    if x_e4m3 is not None:
+        if local_rank == 0:
+            print('\n=== FP8 Direct-Write Dispatch Tests ===', flush=True)
+
+        # Re-register with FP8 layout
+        num_scales_fp8 = hidden // 128
+        buffer.register_direct_write_layout(num_worst_tokens, hidden, num_topk, num_scales_fp8, 1, config)
+
+        if local_rank == 0:
+            print('[testing] FP8 direct-write ...', flush=True, end='')
+
+        # Standard FP8 dispatch (reference)
+        dispatch_args = {
+            'x': x_e4m3, 'num_tokens_per_rank': num_tokens_per_rank,
+            'is_token_in_rank': is_token_in_rank, 'num_tokens_per_expert': num_tokens_per_expert,
+            'topk_idx': topk_idx, 'topk_weights': topk_weights,
+            'config': config,
+        }
+        ref_x, ref_topk_idx, ref_topk_weights, _, _, _ = buffer.dispatch(**dispatch_args)
+        ref_x = per_token_cast_back(*ref_x)
+
+        # Direct-write FP8 dispatch
+        dispatch_args['num_worst_tokens'] = num_worst_tokens
+        dw_x, dw_topk_idx, dw_topk_weights, _, _, _ = buffer.dispatch(**dispatch_args)
+        dw_x = per_token_cast_back(*dw_x)
+        actual_recv = ref_x.size(0)
+
+        assert torch.equal(ref_x, dw_x[:actual_recv]), 'FP8 recv_x mismatch'
+        assert torch.equal(ref_topk_idx, dw_topk_idx[:actual_recv]), 'FP8 recv_topk_idx mismatch'
+        assert torch.all(dw_topk_idx[actual_recv:] == -1).item(), 'FP8 tail not padded'
+
+        if local_rank == 0:
+            print(' passed', flush=True)
+
+    if local_rank == 0:
+        print('\n=== All Direct-Write Dispatch Tests Passed ===\n', flush=True)
+
+
+# noinspection PyShadowingNames
+def main(args: argparse.Namespace, local_rank: int, num_ranks: int, rank: int):
+    torch.cuda.set_device(local_rank)
+    rank, world_size, group = init_dist(local_rank, num_ranks)
+
+    num_sms = args.num_sms if args.num_sms > 0 else 20
+
+    # Use larger buffer to accommodate direct-write region
+    num_nvl_bytes = int(args.buffer_size * 1024 * 1024)
+    buffer = deep_ep.Buffer(group, num_nvl_bytes)
+
+    test_main(num_sms, local_rank, num_ranks, rank, buffer, group,
+              num_tokens=args.num_tokens, hidden=args.hidden,
+              num_topk=args.num_topk, num_experts=args.num_experts)
+
+    if local_rank == 0:
+        print('Success!', flush=True)
+
+
+def spawn_main(local_rank, args):
+    main(args, local_rank, args.num_processes, local_rank)
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--num-tokens', type=int, default=1024)
+    parser.add_argument('--hidden', type=int, default=7168)
+    parser.add_argument('--num-topk', type=int, default=8)
+    parser.add_argument('--num-experts', type=int, default=256)
+    parser.add_argument('--num-sms', type=int, default=20)
+    parser.add_argument('--buffer-size', type=int, default=512, help='NVL buffer size in MiB')
+    parser.add_argument('--num-processes', type=int, default=8)
+    args = parser.parse_args()
+
+    torch.multiprocessing.spawn(spawn_main, args=(args,), nprocs=args.num_processes)

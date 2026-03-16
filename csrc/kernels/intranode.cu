@@ -1,3 +1,4 @@
+#include "api.cuh"
 #include "buffer.cuh"
 #include "configs.cuh"
 #include "exception.cuh"
@@ -607,6 +608,239 @@ void dispatch(void* recv_x,
     SETUP_LAUNCH_CONFIG(num_sms, kNumThreads, stream);
     SWITCH_RANKS(DISPATCH_LAUNCH_CASE);
 #undef DISPATCH_LAUNCH_CASE
+}
+
+// Direct-write dispatch: sender writes directly to receiver's IPC buffer output region.
+// No receiver SMs needed. Only used when num_worst_tokens > 0 and layout is registered.
+template <int kNumRanks, int kNumThreads>
+__global__ void __launch_bounds__(kNumThreads, 1) dispatch_direct_write(
+        int* recv_src_idx,
+        int* recv_channel_offset,
+        int* send_head,
+        const int4* x,
+        const float* x_scales,
+        const topk_idx_t* topk_idx,
+        const float* topk_weights,
+        const bool* is_token_in_rank,
+        const int* channel_prefix_matrix,
+        int num_tokens,
+        int num_worst_tokens,
+        int hidden_int4,
+        int num_topk,
+        int num_experts,
+        int num_scales,
+        int scale_token_stride,
+        int scale_hidden_stride,
+        void** buffer_ptrs,
+        int rank,
+        int64_t recv_x_offset,
+        int64_t recv_topk_idx_offset,
+        int64_t recv_topk_weights_offset,
+        int64_t recv_src_idx_offset,
+        int64_t recv_x_scales_offset,
+        int64_t recv_channel_offset_offset,
+        int elem_size) {
+    const auto num_sms = static_cast<int>(gridDim.x), sm_id = static_cast<int>(blockIdx.x);
+    const auto thread_id = static_cast<int>(threadIdx.x), lane_id = get_lane_id();
+
+    // All SMs are senders (no receiver SMs needed)
+    constexpr int num_send_warps = kNumThreads / 32;
+    constexpr int num_send_warps_per_rank = num_send_warps / kNumRanks;
+    const auto num_threads_per_rank = num_send_warps_per_rank * 32;
+    const auto responsible_rank = thread_id / num_threads_per_rank;
+    const auto responsible_channel = sm_id;
+    const auto num_channels = num_sms;
+    const auto send_warp_id_in_rank = (thread_id % num_threads_per_rank) / 32;
+
+    int num_experts_per_rank = num_experts / kNumRanks;
+    EP_DEVICE_ASSERT(num_experts_per_rank > 0 or num_topk == 0);
+    EP_DEVICE_ASSERT(num_topk <= 32);
+    EP_DEVICE_ASSERT(kNumRanks <= 32);
+    EP_DEVICE_ASSERT(num_send_warps % kNumRanks == 0);
+
+    // Read rank_prefix_matrix from the destination rank's IPC buffer
+    auto dst_rank_prefix_matrix = static_cast<int*>(buffer_ptrs[responsible_rank]);
+    int rank_offset = (rank > 0) ? dst_rank_prefix_matrix[(rank - 1) * kNumRanks + responsible_rank] : 0;
+
+    // Channel offset within this rank's allocation
+    int channel_offset = (responsible_channel > 0) ?
+        channel_prefix_matrix[responsible_rank * num_channels + responsible_channel - 1] : 0;
+
+    // Write recv_channel_offset for combine compatibility
+    if (send_warp_id_in_rank == 0 and elect_one_sync()) {
+        auto dst_recv_channel_offset = reinterpret_cast<int*>(
+            static_cast<uint8_t*>(buffer_ptrs[responsible_rank]) + recv_channel_offset_offset);
+        dst_recv_channel_offset[rank * num_channels + responsible_channel] = channel_offset;
+    }
+
+    // Compute pointers into receiver's IPC buffer output regions
+    auto dst_recv_x_base = static_cast<uint8_t*>(buffer_ptrs[responsible_rank]) + recv_x_offset;
+    auto dst_recv_topk_idx_base = reinterpret_cast<topk_idx_t*>(
+        static_cast<uint8_t*>(buffer_ptrs[responsible_rank]) + recv_topk_idx_offset);
+    auto dst_recv_topk_weights_base = reinterpret_cast<float*>(
+        static_cast<uint8_t*>(buffer_ptrs[responsible_rank]) + recv_topk_weights_offset);
+    auto dst_recv_src_idx_base = reinterpret_cast<int*>(
+        static_cast<uint8_t*>(buffer_ptrs[responsible_rank]) + recv_src_idx_offset);
+    auto dst_recv_x_scales_base = reinterpret_cast<float*>(
+        static_cast<uint8_t*>(buffer_ptrs[responsible_rank]) + recv_x_scales_offset);
+
+    // Get task range for this channel
+    int token_start_idx, token_end_idx;
+    get_channel_task_range(num_tokens, num_channels, responsible_channel, token_start_idx, token_end_idx);
+
+    // Iterate over tokens and write directly to destination
+    int running_count = 0;
+    for (int64_t token_idx = token_start_idx; token_idx < token_end_idx; token_idx++) {
+        // Record send_head for combine compatibility
+        if (token_idx % num_send_warps_per_rank == send_warp_id_in_rank and elect_one_sync())
+            send_head[token_idx * kNumRanks + responsible_rank] =
+                is_token_in_rank[token_idx * kNumRanks + responsible_rank] ? running_count : -1;
+
+        // Skip if not routed to this rank
+        if (not is_token_in_rank[token_idx * kNumRanks + responsible_rank]) {
+            token_idx = token_idx;  // no-op to avoid empty branch warning
+            continue;
+        }
+
+        int dst_offset = rank_offset + channel_offset + running_count;
+
+        if (running_count % num_send_warps_per_rank == send_warp_id_in_rank) {
+            // Bounds check
+            EP_DEVICE_ASSERT(dst_offset < num_worst_tokens);
+
+            // Copy x data
+            auto dst_x_int4 = reinterpret_cast<int4*>(dst_recv_x_base + static_cast<int64_t>(dst_offset) * hidden_int4 * sizeof(int4));
+            auto src_x_int4 = x + token_idx * hidden_int4;
+            UNROLLED_WARP_COPY(5, lane_id, hidden_int4, dst_x_int4, src_x_int4, __ldg, st_na_global);
+
+            // Copy source index
+            if (elect_one_sync())
+                st_na_global(dst_recv_src_idx_base + dst_offset, static_cast<int>(token_idx));
+
+            // Copy topk_idx and topk_weights with index transformation
+            if (lane_id < num_topk) {
+                int recv_expert_begin = responsible_rank * num_experts_per_rank;
+                int recv_expert_end = (responsible_rank + 1) * num_experts_per_rank;
+                auto idx_value = __ldg(topk_idx + token_idx * num_topk + lane_id);
+                idx_value = (idx_value >= recv_expert_begin and idx_value < recv_expert_end) ? idx_value - recv_expert_begin : -1;
+                st_na_global(dst_recv_topk_idx_base + static_cast<int64_t>(dst_offset) * num_topk + lane_id, idx_value);
+
+                auto weight_value = __ldg(topk_weights + token_idx * num_topk + lane_id);
+                weight_value = (idx_value >= 0) ? weight_value : 0.0f;
+                st_na_global(dst_recv_topk_weights_base + static_cast<int64_t>(dst_offset) * num_topk + lane_id, weight_value);
+            }
+
+            // Copy x_scales
+            #pragma unroll
+            for (int i = lane_id; i < num_scales; i += 32) {
+                auto offset = token_idx * scale_token_stride + i * scale_hidden_stride;
+                st_na_global(dst_recv_x_scales_base + static_cast<int64_t>(dst_offset) * num_scales + i, __ldg(x_scales + offset));
+            }
+        }
+
+        running_count++;
+    }
+
+    // Also write recv_src_idx to local output tensor for handle
+    // Re-read from the IPC buffer (now local since we wrote there)
+    auto local_recv_src_idx_base = reinterpret_cast<int*>(
+        static_cast<uint8_t*>(buffer_ptrs[rank]) + recv_src_idx_offset);
+    auto total_recv = static_cast<int*>(buffer_ptrs[rank])[(kNumRanks - 1) * kNumRanks + rank];
+    #pragma unroll
+    for (int i = sm_id * kNumThreads + thread_id; i < total_recv; i += num_sms * kNumThreads)
+        recv_src_idx[i] = local_recv_src_idx_base[i];
+
+    // Clean unused recv_topk_idx as -1 (tail padding)
+    if (num_worst_tokens > 0) {
+        auto local_recv_topk_idx = reinterpret_cast<topk_idx_t*>(
+            static_cast<uint8_t*>(buffer_ptrs[rank]) + recv_topk_idx_offset);
+        const auto num_recv_tokens = static_cast<int*>(buffer_ptrs[rank])[(kNumRanks - 1) * kNumRanks + rank];
+        const auto clean_start = num_recv_tokens * num_topk + sm_id * kNumThreads;
+        const auto clean_end = num_worst_tokens * num_topk;
+        const auto clean_stride = num_sms * kNumThreads;
+        #pragma unroll
+        for (int i = clean_start + thread_id; i < clean_end; i += clean_stride)
+            local_recv_topk_idx[i] = -1;
+    }
+}
+
+void dispatch_direct_write(int* recv_src_idx,
+                           int* recv_channel_offset,
+                           int* send_head,
+                           const void* x,
+                           const float* x_scales,
+                           const topk_idx_t* topk_idx,
+                           const float* topk_weights,
+                           const bool* is_token_in_rank,
+                           const int* channel_prefix_matrix,
+                           int num_tokens,
+                           int num_worst_tokens,
+                           int hidden_int4,
+                           int num_topk,
+                           int num_experts,
+                           int num_scales,
+                           int scale_token_stride,
+                           int scale_hidden_stride,
+                           void** buffer_ptrs,
+                           int** barrier_signal_ptrs,
+                           int rank,
+                           int num_ranks,
+                           cudaStream_t stream,
+                           int num_sms,
+                           int64_t recv_x_offset,
+                           int64_t recv_topk_idx_offset,
+                           int64_t recv_topk_weights_offset,
+                           int64_t recv_src_idx_offset,
+                           int64_t recv_x_scales_offset,
+                           int64_t recv_channel_offset_offset,
+                           int elem_size) {
+    constexpr int kNumThreads = 768;
+
+    // Make sure never OOB
+    EP_HOST_ASSERT(static_cast<int64_t>(num_scales) * scale_hidden_stride < std::numeric_limits<int>::max());
+
+    // Direct-write uses all SMs as senders (no receiver SMs)
+    // num_sms here is the number of sender-only channels
+    int num_channels = num_sms / 2;  // Use half the configured SMs as channels
+    EP_HOST_ASSERT(num_channels > 0);
+
+#define DW_DISPATCH_LAUNCH_CASE(ranks)                                              \
+    LAUNCH_KERNEL(&cfg,                                                             \
+                  dispatch_direct_write<ranks, kNumThreads>,                        \
+                  recv_src_idx,                                                     \
+                  recv_channel_offset,                                              \
+                  send_head,                                                        \
+                  reinterpret_cast<const int4*>(x),                                 \
+                  x_scales,                                                         \
+                  topk_idx,                                                         \
+                  topk_weights,                                                     \
+                  is_token_in_rank,                                                 \
+                  channel_prefix_matrix,                                            \
+                  num_tokens,                                                       \
+                  num_worst_tokens,                                                 \
+                  hidden_int4,                                                      \
+                  num_topk,                                                         \
+                  num_experts,                                                      \
+                  num_scales,                                                       \
+                  scale_token_stride,                                               \
+                  scale_hidden_stride,                                              \
+                  buffer_ptrs,                                                      \
+                  rank,                                                             \
+                  recv_x_offset,                                                    \
+                  recv_topk_idx_offset,                                             \
+                  recv_topk_weights_offset,                                         \
+                  recv_src_idx_offset,                                              \
+                  recv_x_scales_offset,                                             \
+                  recv_channel_offset_offset,                                       \
+                  elem_size);                                                       \
+    break
+
+    SETUP_LAUNCH_CONFIG(num_channels, kNumThreads, stream);
+    SWITCH_RANKS(DW_DISPATCH_LAUNCH_CASE);
+#undef DW_DISPATCH_LAUNCH_CASE
+
+    // Final barrier to ensure all NVLink writes across all ranks are visible
+    barrier(barrier_signal_ptrs, rank, num_ranks, stream);
 }
 
 template <int kNumRanks>
