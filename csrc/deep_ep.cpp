@@ -2234,15 +2234,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             static_cast<int64_t>(num_channels) * num_ranks * config.num_max_nvl_chunked_recv_tokens * num_topk * sizeof(float);
         int64_t region_b_start = std::max(dispatch_scratch, combine_scratch);
         region_b_start = (region_b_start + NUM_BUFFER_ALIGNMENT_BYTES - 1) / NUM_BUFFER_ALIGNMENT_BYTES * NUM_BUFFER_ALIGNMENT_BYTES;
-        // Region B: recv_x + topk_idx + topk_weights + src_idx + scales + channel_offset
-        int64_t region_b =
-            static_cast<int64_t>(num_worst_tokens) * hidden * elem_size +
-            static_cast<int64_t>(num_worst_tokens) * num_topk * sizeof(deep_ep::topk_idx_t) +
-            static_cast<int64_t>(num_worst_tokens) * num_topk * sizeof(float) +
-            static_cast<int64_t>(num_worst_tokens) * sizeof(int) +
-            static_cast<int64_t>(num_worst_tokens) * num_scales * sizeof(float) +
-            static_cast<int64_t>(num_ranks) * num_channels * sizeof(int);
-        region_b = (region_b + NUM_BUFFER_ALIGNMENT_BYTES - 1) / NUM_BUFFER_ALIGNMENT_BYTES * NUM_BUFFER_ALIGNMENT_BYTES;
+        // Region B: each sub-buffer aligned individually (matching register_direct_write_layout)
+        auto align = [](int64_t v) { return (v + NUM_BUFFER_ALIGNMENT_BYTES - 1) / NUM_BUFFER_ALIGNMENT_BYTES * NUM_BUFFER_ALIGNMENT_BYTES; };
+        int64_t region_b = 0;
+        region_b += align(static_cast<int64_t>(num_worst_tokens) * hidden * elem_size);
+        region_b += align(static_cast<int64_t>(num_worst_tokens) * num_topk * sizeof(deep_ep::topk_idx_t));
+        region_b += align(static_cast<int64_t>(num_worst_tokens) * num_topk * sizeof(float));
+        region_b += align(static_cast<int64_t>(num_worst_tokens) * sizeof(int));
+        region_b += align(static_cast<int64_t>(num_worst_tokens) * num_scales * sizeof(float));
+        region_b += align(static_cast<int64_t>(num_ranks) * num_channels * sizeof(int));
         return region_b_start + region_b;
     });
 
