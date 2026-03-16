@@ -129,9 +129,6 @@ private:
     int dw_num_channels = 0;
     int dw_num_max_nvl_chunked_recv_tokens = 0;
 
-    // Track whether the last dispatch used the direct-write path
-    bool last_dispatch_was_direct_write = false;
-
     // Debug: last intranode dispatch grid size (for testing SM-count regression)
     int last_dispatch_grid_size = 0;
 
