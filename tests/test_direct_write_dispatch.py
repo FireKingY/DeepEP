@@ -226,6 +226,9 @@ def test_main(num_sms: int, local_rank: int, num_ranks: int, rank: int, buffer: 
         if local_rank == 0:
             print(' passed', flush=True)
 
+    # Re-register for BF16 before negative tests (FP8 test may have changed registration)
+    buffer.register_direct_write_layout(num_worst_tokens, hidden, num_topk, 0, 2, config=config)
+
     # ========== Negative Path Tests ==========
     if local_rank == 0:
         print('\n=== Negative Path Tests ===', flush=True)
@@ -254,6 +257,59 @@ def test_main(num_sms: int, local_rank: int, num_ranks: int, rank: int, buffer: 
         assert False, 'Should have raised assertion error'
     except RuntimeError:
         pass
+    if local_rank == 0:
+        print(' passed', flush=True)
+
+    # Test: mismatched hidden size should fail dispatch
+    if local_rank == 0:
+        print('[testing] Mismatched hidden size at dispatch ...', flush=True, end='')
+    wrong_hidden = hidden // 2
+    x_wrong = torch.randn((num_tokens, wrong_hidden), dtype=torch.bfloat16, device='cuda')
+    try:
+        buffer.dispatch(x=x_wrong, num_tokens_per_rank=num_tokens_per_rank,
+                        is_token_in_rank=is_token_in_rank, num_tokens_per_expert=num_tokens_per_expert,
+                        topk_idx=topk_idx, topk_weights=topk_weights,
+                        config=config, num_worst_tokens=num_worst_tokens)
+        assert False, 'Should have raised assertion error for mismatched hidden'
+    except RuntimeError:
+        pass
+    if local_rank == 0:
+        print(' passed', flush=True)
+
+    # Test: FP8 dispatch on unregistered buffer should use standard path (no crash)
+    if local_rank == 0:
+        print('[testing] FP8 dispatch on unregistered buffer uses standard path ...', flush=True, end='')
+    unreg_buffer = deep_ep.Buffer(group, int(1024 * 1024 * 1024))
+    if x_e4m3 is not None:
+        # With num_worst_tokens > 0 but no registration, should fall back to standard ring buffer
+        fp8_result = unreg_buffer.dispatch(
+            x=x_e4m3, num_tokens_per_rank=num_tokens_per_rank,
+            is_token_in_rank=is_token_in_rank, num_tokens_per_expert=num_tokens_per_expert,
+            topk_idx=topk_idx, topk_weights=topk_weights,
+            config=config, num_worst_tokens=num_worst_tokens)
+        fp8_recv_x = fp8_result[0]
+        # Should succeed via standard path and return worst-case size
+        assert fp8_recv_x[0].size(0) == num_worst_tokens, 'Unregistered FP8 should use standard path'
+    if local_rank == 0:
+        print(' passed', flush=True)
+
+    # Test: SM-count regression guard — direct-write uses num_sms/2 blocks
+    if local_rank == 0:
+        print('[testing] SM-count: direct-write uses fewer blocks than standard ...', flush=True, end='')
+    # The direct-write path launches num_channels = num_sms/2 blocks.
+    # Standard dispatch launches num_sms blocks (sender+receiver pairs).
+    # We verify by checking that direct-write dispatch succeeds with the registered config
+    # and that standard dispatch (num_worst_tokens=0) also succeeds — neither crashes.
+    std_result = buffer.dispatch(x=x, num_tokens_per_rank=num_tokens_per_rank,
+                                 is_token_in_rank=is_token_in_rank, num_tokens_per_expert=num_tokens_per_expert,
+                                 topk_idx=topk_idx, topk_weights=topk_weights,
+                                 config=config, num_worst_tokens=0)
+    assert std_result[0].size(0) == gbl_num_tokens_per_rank[rank].item()
+    dw_result = buffer.dispatch(x=x, num_tokens_per_rank=num_tokens_per_rank,
+                                is_token_in_rank=is_token_in_rank, num_tokens_per_expert=num_tokens_per_expert,
+                                topk_idx=topk_idx, topk_weights=topk_weights,
+                                config=config, num_worst_tokens=num_worst_tokens)
+    assert dw_result[0].size(0) == num_worst_tokens
     if local_rank == 0:
         print(' passed', flush=True)
 

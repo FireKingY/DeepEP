@@ -127,6 +127,7 @@ private:
     int64_t dw_recv_channel_offset_offset = 0;
     int64_t dw_region_b_size = 0;  // total bytes for Region B
     int dw_num_channels = 0;
+    int dw_num_max_nvl_chunked_recv_tokens = 0;
 
 public:
     Buffer(int rank,

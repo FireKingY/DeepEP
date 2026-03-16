@@ -857,11 +857,16 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
 
     // Combine data
     auto recv_x = torch::empty({num_recv_tokens, hidden}, x.options());
-    EP_HOST_ASSERT(num_channels * num_ranks * sizeof(int) * 2 +  // Queue head and tail
-                       num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * hidden * x.element_size() +  // Data buffer
-                       num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * sizeof(int) +             // Source index buffer
-                       num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * num_topk * sizeof(float)  // Top-k weight buffer
-                   <= num_nvl_bytes);
+    int64_t combine_scratch_bytes =
+        static_cast<int64_t>(num_channels) * num_ranks * sizeof(int) * 2 +
+        static_cast<int64_t>(num_channels) * num_ranks * config.num_max_nvl_chunked_recv_tokens * hidden * x.element_size() +
+        static_cast<int64_t>(num_channels) * num_ranks * config.num_max_nvl_chunked_recv_tokens * sizeof(int) +
+        static_cast<int64_t>(num_channels) * num_ranks * config.num_max_nvl_chunked_recv_tokens * num_topk * sizeof(float);
+    EP_HOST_ASSERT(combine_scratch_bytes <= num_nvl_bytes);
+    if (direct_write_registered) {
+        EP_HOST_ASSERT(combine_scratch_bytes <= dw_recv_x_offset &&
+            "Combine scratch overlaps direct-write Region B. Use a matching config or re-register.");
+    }
     intranode::combine(at::cuda::ScalarTypeToCudaDataType(x.scalar_type()),
                        recv_x.data_ptr(),
                        recv_topk_weights_ptr,
@@ -984,6 +989,7 @@ void Buffer::register_direct_write_layout(int num_worst_tokens, int hidden, int 
     dw_num_scales = num_scales;
     dw_elem_size = elem_size;
     dw_num_channels = num_channels;
+    dw_num_max_nvl_chunked_recv_tokens = num_max_nvl_chunked_recv_tokens;
     direct_write_registered = true;
 }
 
@@ -1022,6 +1028,8 @@ Buffer::intranode_dispatch_direct_write(const torch::Tensor& x,
     int num_channels = config.num_sms / 2;
     EP_HOST_ASSERT(num_channels > 0);
     EP_HOST_ASSERT(num_channels == dw_num_channels && "Config num_sms does not match registered layout");
+    EP_HOST_ASSERT(config.num_max_nvl_chunked_recv_tokens == dw_num_max_nvl_chunked_recv_tokens &&
+        "Config num_max_nvl_chunked_recv_tokens does not match registered layout");
     EP_HOST_ASSERT(num_tokens_per_rank.has_value());
     EP_HOST_ASSERT(num_tokens_per_expert.has_value());
 
