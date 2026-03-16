@@ -320,15 +320,25 @@ def test_main(num_sms: int, local_rank: int, num_ranks: int, rank: int, buffer: 
         print('[testing] Corrupted send_head causes process crash (subprocess) ...', flush=True, end='')
     if local_rank == 0:
         import subprocess
-        helper = os.path.join(os.path.dirname(__file__), '_corrupt_send_head_helper.py')
+        helper = os.path.join(os.path.dirname(os.path.abspath(__file__)), '_corrupt_send_head_helper.py')
         env = os.environ.copy()
         env['MASTER_PORT'] = '8399'  # Use different port to avoid conflict
+        env['PYTHONPATH'] = os.path.dirname(os.path.dirname(os.path.abspath(__file__))) + \
+            ((':' + env['PYTHONPATH']) if 'PYTHONPATH' in env else '')
         result = subprocess.run(
             [sys.executable, helper],
-            env=env, timeout=120, capture_output=True, text=True)
-        # The helper should exit with non-zero (trap kills the process)
+            env=env, timeout=180, capture_output=True, text=True)
+        combined_output = result.stdout + result.stderr
+        # 1. Verify the helper reached the corrupted combine call (not a bootstrap failure)
+        assert 'REACHED_CORRUPTED_COMBINE' in combined_output, \
+            f'Helper did not reach corrupted combine path. Bootstrap failure?\n' \
+            f'returncode={result.returncode}\nstderr: {result.stderr[:1000]}'
+        # 2. Verify the process crashed (non-zero exit from kernel trap/timeout)
         assert result.returncode != 0, \
-            f'Corrupted send_head should crash, but process exited with 0. stderr: {result.stderr[:500]}'
+            f'Corrupted send_head should crash, but process exited with 0.\nstderr: {result.stderr[:500]}'
+        # 3. Verify it was not a silent success (no "ERROR: combine did not fail" message)
+        assert 'ERROR: combine did not fail' not in combined_output, \
+            'Helper reached past combine without crashing — send_head corruption was not detected'
         print(' passed', flush=True)
     group.barrier()
 

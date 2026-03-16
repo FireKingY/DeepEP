@@ -1,17 +1,30 @@
 """Helper script invoked by test_direct_write_dispatch.py as a subprocess.
 Corrupts send_head in a direct-write dispatch handle, then calls combine.
-Expected to crash via kernel trap (non-zero exit)."""
+Expected to crash via kernel trap (non-zero exit).
+
+The marker 'REACHED_CORRUPTED_COMBINE' is printed to stderr immediately
+before the corrupted combine call, so the parent test can verify the
+helper actually reached the critical code path before failing."""
 import sys
 import os
-import torch
-import torch.distributed as dist
 
-sys.path.insert(0, os.path.dirname(__file__))
+# Add both the tests/ dir (for utils) and the repo root (for deep_ep)
+_tests_dir = os.path.dirname(os.path.abspath(__file__))
+_repo_root = os.path.dirname(_tests_dir)
+sys.path.insert(0, _tests_dir)
+sys.path.insert(0, _repo_root)
+
+import torch
+
+# noinspection PyUnresolvedReferences
 import deep_ep
 from utils import init_dist, inplace_unique
 
+_NUM_PROCESSES = 8
 
-def run(local_rank, num_ranks):
+
+def run(local_rank):
+    num_ranks = _NUM_PROCESSES
     torch.cuda.set_device(local_rank)
     rank, _, group = init_dist(local_rank, num_ranks)
 
@@ -64,16 +77,18 @@ def run(local_rank, num_ranks):
     corrupted_sh[corrupted_sh >= 0] = 999999
     corrupted_handle = (rank_pm, chan_pm, recv_chan_pm, src_idx[:actual_recv], is_tir, corrupted_sh)
 
+    # Emit marker so the parent test can verify we reached this point
+    print("REACHED_CORRUPTED_COMBINE", file=sys.stderr, flush=True)
+
     # This should trap/timeout and kill the process
     buffer.combine(x=recv_x[:actual_recv], handle=corrupted_handle,
                    topk_weights=topk_w[:actual_recv], config=config)
     torch.cuda.synchronize()
 
     # If we get here, the test failed — combine should have trapped
-    print("ERROR: combine did not fail with corrupted send_head", file=sys.stderr)
+    print("ERROR: combine did not fail with corrupted send_head", file=sys.stderr, flush=True)
     sys.exit(0)  # Return 0 = test failure (we expected non-zero)
 
 
 if __name__ == '__main__':
-    num_processes = 8
-    torch.multiprocessing.spawn(lambda lr: run(lr, num_processes), nprocs=num_processes)
+    torch.multiprocessing.spawn(run, nprocs=_NUM_PROCESSES)
