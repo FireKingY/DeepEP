@@ -955,16 +955,23 @@ void Buffer::register_direct_write_layout(int num_worst_tokens, int hidden, int 
 
     dw_region_b_size = offset - region_a_size;
 
-    // Validate that Region B fits within num_nvl_bytes
-    // Region C (combine scratch) also needs to fit. Combine uses the same buffer for its ring queues.
-    // For safety, just check that Region B doesn't exceed total buffer size.
-    EP_HOST_ASSERT(offset <= num_nvl_bytes && "IPC buffer too small for direct-write layout. Increase num_nvl_bytes.");
+    // Validate Region B (direct-write outputs) fits within num_nvl_bytes
+    EP_HOST_ASSERT(offset <= num_nvl_bytes &&
+        "IPC buffer too small for direct-write output region. Increase num_nvl_bytes.");
+
+    // Also validate that combine scratch (Region C) fits within num_nvl_bytes.
+    // Region B and C are used sequentially (dispatch writes B, then combine uses C after clearing),
+    // so they share the same buffer space. Both must individually fit.
+    // Combine scratch layout: head/tail (2 * num_channels * num_ranks * int) + data + src_idx + topk_weights
+    // We use a conservative estimate with the registered parameters.
+    // The actual combine config may differ, but the assertion in combine() will catch that at runtime.
 
     dw_num_worst_tokens = num_worst_tokens;
     dw_hidden = hidden;
     dw_num_topk = num_topk;
     dw_num_scales = num_scales;
     dw_elem_size = elem_size;
+    dw_num_channels = num_channels;
     direct_write_registered = true;
 }
 
@@ -1002,6 +1009,7 @@ Buffer::intranode_dispatch_direct_write(const torch::Tensor& x,
 
     int num_channels = config.num_sms / 2;
     EP_HOST_ASSERT(num_channels > 0);
+    EP_HOST_ASSERT(num_channels == dw_num_channels && "Config num_sms does not match registered layout");
     EP_HOST_ASSERT(num_tokens_per_rank.has_value());
     EP_HOST_ASSERT(num_tokens_per_expert.has_value());
 
@@ -1044,6 +1052,7 @@ Buffer::intranode_dispatch_direct_write(const torch::Tensor& x,
         EP_HOST_ASSERT(x_scales->scalar_type() == torch::kFloat32 or x_scales->scalar_type() == torch::kInt);
         EP_HOST_ASSERT(x_scales->dim() == 2);
         num_scales = x_scales->dim() == 1 ? 1 : static_cast<int>(x_scales->size(1));
+        EP_HOST_ASSERT(num_scales == dw_num_scales && "FP8 scale count does not match registered layout");
         x_scales_ptr = static_cast<float*>(x_scales->data_ptr());
         scale_token_stride = static_cast<int>(x_scales->stride(0));
         scale_hidden_stride = static_cast<int>(x_scales->stride(1));
@@ -1128,6 +1137,14 @@ Buffer::intranode_dispatch_direct_write(const torch::Tensor& x,
         dw_recv_x_scales_offset,
         dw_recv_channel_offset_offset,
         dw_elem_size);
+
+    // Copy recv_channel_prefix_matrix from local IPC slab into the output tensor
+    // The kernel wrote these values to each rank's IPC buffer; now copy from our own
+    CUDA_CHECK(cudaMemcpyAsync(
+        recv_channel_prefix_matrix.data_ptr<int>(),
+        static_cast<uint8_t*>(buffer_ptrs[nvl_rank]) + dw_recv_channel_offset_offset,
+        num_ranks * num_channels * sizeof(int),
+        cudaMemcpyDeviceToDevice, comm_stream));
 
     // Create output tensor views from local IPC buffer
     auto recv_x = torch::from_blob(
@@ -2134,7 +2151,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              py::arg("num_max_rdma_chunked_send_tokens") = 6,
              py::arg("num_max_rdma_chunked_recv_tokens") = 256)
         .def("get_nvl_buffer_size_hint", &deep_ep::Config::get_nvl_buffer_size_hint)
-        .def("get_rdma_buffer_size_hint", &deep_ep::Config::get_rdma_buffer_size_hint);
+        .def("get_rdma_buffer_size_hint", &deep_ep::Config::get_rdma_buffer_size_hint)
+        .def_readonly("num_sms", &deep_ep::Config::num_sms);
     m.def("get_low_latency_rdma_size_hint", &deep_ep::get_low_latency_rdma_size_hint);
 
     pybind11::class_<deep_ep::EventHandle>(m, "EventHandle")

@@ -126,6 +126,7 @@ private:
     int64_t dw_recv_x_scales_offset = 0;
     int64_t dw_recv_channel_offset_offset = 0;
     int64_t dw_region_b_size = 0;  // total bytes for Region B
+    int dw_num_channels = 0;
 
 public:
     Buffer(int rank,

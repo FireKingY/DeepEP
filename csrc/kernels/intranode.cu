@@ -697,10 +697,8 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch_direct_write(
                 is_token_in_rank[token_idx * kNumRanks + responsible_rank] ? running_count : -1;
 
         // Skip if not routed to this rank
-        if (not is_token_in_rank[token_idx * kNumRanks + responsible_rank]) {
-            token_idx = token_idx;  // no-op to avoid empty branch warning
+        if (not is_token_in_rank[token_idx * kNumRanks + responsible_rank])
             continue;
-        }
 
         int dst_offset = rank_offset + channel_offset + running_count;
 

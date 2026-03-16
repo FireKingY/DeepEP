@@ -151,7 +151,7 @@ class Buffer:
 
     def register_direct_write_layout(self, num_worst_tokens: int, hidden: int, num_topk: int,
                                       num_scales: int = 0, elem_size: int = 2,
-                                      config=None) -> None:
+                                      config: Optional[Config] = None) -> None:
         """
         Register a fixed output layout for direct-write dispatch (num_worst_tokens > 0 path).
         Output tensors are allocated within the IPC buffer, eliminating the ring buffer copy.
@@ -163,9 +163,12 @@ class Buffer:
             num_topk: the number of top-k experts per token.
             num_scales: the number of FP8 scales (0 for BF16).
             elem_size: element size in bytes (2 for BF16, 1 for FP8).
-            config: optional config to determine num_channels (or use default).
+            config: optional config to determine num_channels. If None, uses Buffer.num_sms.
         """
-        num_channels = Buffer.num_sms // 2
+        if config is not None:
+            num_channels = config.num_sms // 2
+        else:
+            num_channels = Buffer.num_sms // 2
         self.runtime.register_direct_write_layout(num_worst_tokens, hidden, num_topk, num_scales, elem_size, num_channels)
 
     def is_direct_write_registered(self) -> bool:

@@ -113,6 +113,9 @@ def test_main(num_sms: int, local_rank: int, num_ranks: int, rank: int, buffer: 
             # Tail padding check
             assert torch.all(dw_topk_idx[actual_recv:] == -1).item(), f'Tail topk_idx not padded with -1'
 
+            # Handle metadata check: recv_channel_prefix_matrix and send_head
+            # are validated indirectly via combine round-trip test below
+
             if local_rank == 0:
                 print(' passed', flush=True)
 
@@ -141,13 +144,16 @@ def test_main(num_sms: int, local_rank: int, num_ranks: int, rank: int, buffer: 
         dw_recv_x, dw_topk_idx, dw_topk_weights, _, dw_handle, _ = buffer.dispatch(**dispatch_args)
         actual_recv = ref_recv_x.size(0)
 
-        # Combine uses the actual received tokens, not the worst-case padded ones
-        # We need to slice the handle's src_idx to match
+        # IMPORTANT: copy recv_x out of the IPC buffer before combine, because combine
+        # reuses the IPC buffer for its own ring queue and would corrupt the data.
+        dw_recv_x_copy = dw_recv_x[:actual_recv].clone()
+        dw_topk_weights_copy = dw_topk_weights[:actual_recv].clone()
+
         rank_pm, chan_pm, recv_chan_pm, src_idx, is_tir, send_hd = dw_handle
         sliced_handle = (rank_pm, chan_pm, recv_chan_pm, src_idx[:actual_recv], is_tir, send_hd)
         dw_combined_x, dw_combined_tw, _ = buffer.combine(
-            x=dw_recv_x[:actual_recv], handle=sliced_handle,
-            topk_weights=dw_topk_weights[:actual_recv], config=config)
+            x=dw_recv_x_copy, handle=sliced_handle,
+            topk_weights=dw_topk_weights_copy, config=config)
 
         # Verify combine results match
         assert calc_diff(ref_combined_x.float(), dw_combined_x.float()) < 5e-6, \
@@ -172,11 +178,14 @@ def test_main(num_sms: int, local_rank: int, num_ranks: int, rank: int, buffer: 
         }
         dw_recv_x, dw_topk_idx, dw_topk_weights, _, dw_handle, _ = buffer.dispatch(**dispatch_args)
         actual_recv = gbl_num_tokens_per_rank[rank].item()
+        # Clone IPC-backed tensors before combine (combine reuses the IPC buffer)
+        dw_recv_x_copy = dw_recv_x[:actual_recv].clone()
+        dw_topk_weights_copy = dw_topk_weights[:actual_recv].clone()
         rank_pm, chan_pm, recv_chan_pm, src_idx, is_tir, send_hd = dw_handle
         sliced_handle = (rank_pm, chan_pm, recv_chan_pm, src_idx[:actual_recv], is_tir, send_hd)
         dw_combined_x, _, _ = buffer.combine(
-            x=dw_recv_x[:actual_recv], handle=sliced_handle,
-            topk_weights=dw_topk_weights[:actual_recv], config=config)
+            x=dw_recv_x_copy, handle=sliced_handle,
+            topk_weights=dw_topk_weights_copy, config=config)
         check_x = dw_combined_x.float() / is_token_in_rank.sum(dim=1).unsqueeze(1)
         assert calc_diff(check_x, x) < 5e-6, f'Cycle {cycle}: combine result mismatch'
 
@@ -202,21 +211,47 @@ def test_main(num_sms: int, local_rank: int, num_ranks: int, rank: int, buffer: 
             'topk_idx': topk_idx, 'topk_weights': topk_weights,
             'config': config,
         }
-        ref_x, ref_topk_idx, ref_topk_weights, _, _, _ = buffer.dispatch(**dispatch_args)
-        ref_x = per_token_cast_back(*ref_x)
+        ref_result = buffer.dispatch(**dispatch_args)
+        ref_x_tuple, ref_topk_idx, ref_topk_weights, _, _, _ = ref_result
+        ref_x_data, ref_x_scales = ref_x_tuple
+        ref_x_bf16 = per_token_cast_back(ref_x_data, ref_x_scales)
 
         # Direct-write FP8 dispatch
         dispatch_args['num_worst_tokens'] = num_worst_tokens
-        dw_x, dw_topk_idx, dw_topk_weights, _, _, _ = buffer.dispatch(**dispatch_args)
-        dw_x = per_token_cast_back(*dw_x)
-        actual_recv = ref_x.size(0)
+        dw_result = buffer.dispatch(**dispatch_args)
+        dw_x_tuple, dw_topk_idx, dw_topk_weights, _, _, _ = dw_result
+        dw_x_data, dw_x_scales = dw_x_tuple
+        dw_x_bf16 = per_token_cast_back(dw_x_data, dw_x_scales)
+        actual_recv = ref_x_bf16.size(0)
 
-        assert torch.equal(ref_x, dw_x[:actual_recv]), 'FP8 recv_x mismatch'
+        assert torch.equal(ref_x_bf16, dw_x_bf16[:actual_recv]), 'FP8 recv_x mismatch'
+        assert torch.equal(ref_x_data, dw_x_data[:actual_recv]), 'FP8 raw recv_x mismatch'
+        assert torch.equal(ref_x_scales, dw_x_scales[:actual_recv]), 'FP8 recv_x_scales mismatch'
         assert torch.equal(ref_topk_idx, dw_topk_idx[:actual_recv]), 'FP8 recv_topk_idx mismatch'
         assert torch.all(dw_topk_idx[actual_recv:] == -1).item(), 'FP8 tail not padded'
 
         if local_rank == 0:
             print(' passed', flush=True)
+
+    # ========== Negative Path Tests ==========
+    if local_rank == 0:
+        print('\n=== Negative Path Tests ===', flush=True)
+
+    # Test: num_worst_tokens=0 should NOT use direct-write (falls back to standard)
+    if local_rank == 0:
+        print('[testing] num_worst_tokens=0 fallback ...', flush=True, end='')
+    dispatch_args = {
+        'x': x, 'num_tokens_per_rank': num_tokens_per_rank,
+        'is_token_in_rank': is_token_in_rank, 'num_tokens_per_expert': num_tokens_per_expert,
+        'topk_idx': topk_idx, 'topk_weights': topk_weights,
+        'config': config, 'num_worst_tokens': 0,
+    }
+    ref_x, ref_topk_idx, ref_topk_weights, ref_expert_list, _, _ = buffer.dispatch(**dispatch_args)
+    # Standard path returns actual recv count, not worst-case
+    assert ref_x.size(0) == gbl_num_tokens_per_rank[rank].item(), 'num_worst_tokens=0 should use standard path'
+    assert len(ref_expert_list) > 0, 'Standard path should return expert list'
+    if local_rank == 0:
+        print(' passed', flush=True)
 
     if local_rank == 0:
         print('\n=== All Direct-Write Dispatch Tests Passed ===\n', flush=True)
