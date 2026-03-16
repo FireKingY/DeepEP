@@ -268,7 +268,7 @@ public:
         bool async,
         bool allocate_on_comm_stream);
 
-    void register_direct_write_layout(int num_worst_tokens, int hidden, int num_topk, int num_scales, int elem_size, int num_channels);
+    void register_direct_write_layout(int num_worst_tokens, int hidden, int num_topk, int num_scales, int elem_size, int num_channels, int num_max_nvl_chunked_recv_tokens);
 
     bool is_direct_write_registered() const;
 

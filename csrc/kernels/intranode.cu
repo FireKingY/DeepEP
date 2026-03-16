@@ -614,8 +614,6 @@ void dispatch(void* recv_x,
 // No receiver SMs needed. Only used when num_worst_tokens > 0 and layout is registered.
 template <int kNumRanks, int kNumThreads>
 __global__ void __launch_bounds__(kNumThreads, 1) dispatch_direct_write(
-        int* recv_src_idx,
-        int* recv_channel_offset,
         int* send_head,
         const int4* x,
         const float* x_scales,
@@ -739,15 +737,6 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch_direct_write(
         running_count++;
     }
 
-    // Also write recv_src_idx to local output tensor for handle
-    // Re-read from the IPC buffer (now local since we wrote there)
-    auto local_recv_src_idx_base = reinterpret_cast<int*>(
-        static_cast<uint8_t*>(buffer_ptrs[rank]) + recv_src_idx_offset);
-    auto total_recv = static_cast<int*>(buffer_ptrs[rank])[(kNumRanks - 1) * kNumRanks + rank];
-    #pragma unroll
-    for (int i = sm_id * kNumThreads + thread_id; i < total_recv; i += num_sms * kNumThreads)
-        recv_src_idx[i] = local_recv_src_idx_base[i];
-
     // Clean unused recv_topk_idx as -1 (tail padding)
     if (num_worst_tokens > 0) {
         auto local_recv_topk_idx = reinterpret_cast<topk_idx_t*>(
@@ -762,9 +751,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch_direct_write(
     }
 }
 
-void dispatch_direct_write(int* recv_src_idx,
-                           int* recv_channel_offset,
-                           int* send_head,
+void dispatch_direct_write(int* send_head,
                            const void* x,
                            const float* x_scales,
                            const topk_idx_t* topk_idx,
@@ -805,8 +792,6 @@ void dispatch_direct_write(int* recv_src_idx,
 #define DW_DISPATCH_LAUNCH_CASE(ranks)                                              \
     LAUNCH_KERNEL(&cfg,                                                             \
                   dispatch_direct_write<ranks, kNumThreads>,                        \
-                  recv_src_idx,                                                     \
-                  recv_channel_offset,                                              \
                   send_head,                                                        \
                   reinterpret_cast<const int4*>(x),                                 \
                   x_scales,                                                         \

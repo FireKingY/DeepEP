@@ -58,8 +58,7 @@ def test_main(num_sms: int, local_rank: int, num_ranks: int, rank: int, buffer: 
 
     # Register direct-write layout for BF16
     num_scales_bf16 = 0
-    deep_ep.Buffer.set_num_sms(num_sms)
-    buffer.register_direct_write_layout(num_worst_tokens, hidden, num_topk, num_scales_bf16, 2)
+    buffer.register_direct_write_layout(num_worst_tokens, hidden, num_topk, num_scales_bf16, 2, config)
     assert buffer.is_direct_write_registered()
 
     # Helper to check data pattern
@@ -144,16 +143,13 @@ def test_main(num_sms: int, local_rank: int, num_ranks: int, rank: int, buffer: 
         dw_recv_x, dw_topk_idx, dw_topk_weights, _, dw_handle, _ = buffer.dispatch(**dispatch_args)
         actual_recv = ref_recv_x.size(0)
 
-        # IMPORTANT: copy recv_x out of the IPC buffer before combine, because combine
-        # reuses the IPC buffer for its own ring queue and would corrupt the data.
-        dw_recv_x_copy = dw_recv_x[:actual_recv].clone()
-        dw_topk_weights_copy = dw_topk_weights[:actual_recv].clone()
-
+        # Region B (direct-write outputs) is disjoint from combine scratch,
+        # so no clone needed — combine won't corrupt the IPC-backed tensors.
         rank_pm, chan_pm, recv_chan_pm, src_idx, is_tir, send_hd = dw_handle
         sliced_handle = (rank_pm, chan_pm, recv_chan_pm, src_idx[:actual_recv], is_tir, send_hd)
         dw_combined_x, dw_combined_tw, _ = buffer.combine(
-            x=dw_recv_x_copy, handle=sliced_handle,
-            topk_weights=dw_topk_weights_copy, config=config)
+            x=dw_recv_x[:actual_recv], handle=sliced_handle,
+            topk_weights=dw_topk_weights[:actual_recv], config=config)
 
         # Verify combine results match
         assert calc_diff(ref_combined_x.float(), dw_combined_x.float()) < 5e-6, \
@@ -178,14 +174,11 @@ def test_main(num_sms: int, local_rank: int, num_ranks: int, rank: int, buffer: 
         }
         dw_recv_x, dw_topk_idx, dw_topk_weights, _, dw_handle, _ = buffer.dispatch(**dispatch_args)
         actual_recv = gbl_num_tokens_per_rank[rank].item()
-        # Clone IPC-backed tensors before combine (combine reuses the IPC buffer)
-        dw_recv_x_copy = dw_recv_x[:actual_recv].clone()
-        dw_topk_weights_copy = dw_topk_weights[:actual_recv].clone()
         rank_pm, chan_pm, recv_chan_pm, src_idx, is_tir, send_hd = dw_handle
         sliced_handle = (rank_pm, chan_pm, recv_chan_pm, src_idx[:actual_recv], is_tir, send_hd)
         dw_combined_x, _, _ = buffer.combine(
-            x=dw_recv_x_copy, handle=sliced_handle,
-            topk_weights=dw_topk_weights_copy, config=config)
+            x=dw_recv_x[:actual_recv], handle=sliced_handle,
+            topk_weights=dw_topk_weights[:actual_recv], config=config)
         check_x = dw_combined_x.float() / is_token_in_rank.sum(dim=1).unsqueeze(1)
         assert calc_diff(check_x, x) < 5e-6, f'Cycle {cycle}: combine result mismatch'
 
@@ -199,7 +192,7 @@ def test_main(num_sms: int, local_rank: int, num_ranks: int, rank: int, buffer: 
 
         # Re-register with FP8 layout
         num_scales_fp8 = hidden // 128
-        buffer.register_direct_write_layout(num_worst_tokens, hidden, num_topk, num_scales_fp8, 1, config)
+        buffer.register_direct_write_layout(num_worst_tokens, hidden, num_topk, num_scales_fp8, 1, config=config)
 
         if local_rank == 0:
             print('[testing] FP8 direct-write ...', flush=True, end='')
@@ -247,14 +240,93 @@ def test_main(num_sms: int, local_rank: int, num_ranks: int, rank: int, buffer: 
         'config': config, 'num_worst_tokens': 0,
     }
     ref_x, ref_topk_idx, ref_topk_weights, ref_expert_list, _, _ = buffer.dispatch(**dispatch_args)
-    # Standard path returns actual recv count, not worst-case
     assert ref_x.size(0) == gbl_num_tokens_per_rank[rank].item(), 'num_worst_tokens=0 should use standard path'
     assert len(ref_expert_list) > 0, 'Standard path should return expert list'
     if local_rank == 0:
         print(' passed', flush=True)
 
+    # Test: insufficient buffer size should fail registration
+    if local_rank == 0:
+        print('[testing] Insufficient buffer size at registration ...', flush=True, end='')
+    tiny_buffer = deep_ep.Buffer(group, 1024)  # 1 KiB -- way too small
+    try:
+        tiny_buffer.register_direct_write_layout(num_worst_tokens, hidden, num_topk, 0, 2, config=config)
+        assert False, 'Should have raised assertion error'
+    except RuntimeError:
+        pass
+    if local_rank == 0:
+        print(' passed', flush=True)
+
     if local_rank == 0:
         print('\n=== All Direct-Write Dispatch Tests Passed ===\n', flush=True)
+
+
+def test_handle_parity(num_sms: int, local_rank: int, num_ranks: int, rank: int,
+                       buffer_dw: deep_ep.Buffer, buffer_std: deep_ep.Buffer,
+                       group: dist.ProcessGroup, config,
+                       num_tokens: int = 1024, hidden: int = 7168,
+                       num_topk: int = 8, num_experts: int = 256):
+    """Compare handle metadata between direct-write and standard dispatch paths."""
+    if local_rank == 0:
+        print('=== Handle Parity Tests ===', flush=True)
+
+    assert num_experts % num_ranks == 0
+    scores = torch.randn((num_tokens, num_experts), dtype=torch.float32, device='cuda').abs() + 1
+    topk_idx = torch.topk(scores, num_topk, dim=-1, largest=True, sorted=False)[1].to(deep_ep.topk_idx_t)
+    topk_weights = torch.randn((num_tokens, num_topk), dtype=torch.float32, device='cuda')
+    x = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
+
+    rank_idx = topk_idx // (num_experts // num_ranks)
+    rank_idx = rank_idx.to(torch.int64)
+    rank_idx.masked_fill_(topk_idx == -1, -1)
+    inplace_unique(rank_idx, num_ranks)
+
+    num_tokens_per_expert = torch.zeros((num_experts,), dtype=torch.int, device='cuda')
+    for i in range(num_experts):
+        num_tokens_per_expert[i] = (topk_idx == i).sum()
+    num_tokens_per_rank = torch.empty((num_ranks,), dtype=torch.int, device='cuda')
+    for i in range(num_ranks):
+        num_tokens_per_rank[i] = (rank_idx == i).sum()
+    token_idx_in_rank = torch.full((num_ranks, num_tokens), -1, dtype=torch.long, device='cuda')
+    for i in range(num_ranks):
+        token_sel = (rank_idx == i).max(dim=-1)[0]
+        count = token_sel.sum().item()
+        tokens = torch.sort(token_sel.to(torch.int), descending=True)[1]
+        tokens[:count] = torch.sort(tokens[:count])[0]
+        token_idx_in_rank[i][tokens[:count]] = torch.arange(count, dtype=torch.long, device='cuda')
+    is_token_in_rank = (token_idx_in_rank.T.contiguous().to(torch.int) >= 0)
+
+    num_worst_tokens = num_tokens * num_ranks
+
+    # Standard dispatch with num_worst_tokens (no registration on buffer_std)
+    if local_rank == 0:
+        print('[testing] Handle parity: send_head, recv_channel_prefix_matrix, recv_src_idx ...', flush=True, end='')
+
+    std_args = {
+        'x': x, 'num_tokens_per_rank': num_tokens_per_rank,
+        'is_token_in_rank': is_token_in_rank, 'num_tokens_per_expert': num_tokens_per_expert,
+        'topk_idx': topk_idx, 'topk_weights': topk_weights,
+        'config': config, 'num_worst_tokens': num_worst_tokens,
+    }
+    _, _, _, _, std_handle, _ = buffer_std.dispatch(**std_args)
+
+    # Direct-write dispatch
+    dw_args = dict(std_args)
+    _, _, _, _, dw_handle, _ = buffer_dw.dispatch(**dw_args)
+
+    # Compare handle metadata
+    std_rpm, std_cpm, std_rcpm, std_src, std_itr, std_sh = std_handle
+    dw_rpm, dw_cpm, dw_rcpm, dw_src, dw_itr, dw_sh = dw_handle
+
+    assert torch.equal(std_sh, dw_sh), 'send_head mismatch'
+    assert torch.equal(std_rcpm, dw_rcpm), 'recv_channel_prefix_matrix mismatch'
+
+    # recv_src_idx: compare up to actual received count
+    actual_recv = std_rpm[-1][rank].item()
+    assert torch.equal(std_src[:actual_recv], dw_src[:actual_recv]), 'recv_src_idx mismatch'
+
+    if local_rank == 0:
+        print(' passed', flush=True)
 
 
 # noinspection PyShadowingNames
@@ -264,13 +336,21 @@ def main(args: argparse.Namespace, local_rank: int, num_ranks: int, rank: int):
 
     num_sms = args.num_sms if args.num_sms > 0 else 20
 
-    # Use larger buffer to accommodate direct-write region
+    # Use larger buffer to accommodate disjoint direct-write region
     num_nvl_bytes = int(args.buffer_size * 1024 * 1024)
     buffer = deep_ep.Buffer(group, num_nvl_bytes)
 
     test_main(num_sms, local_rank, num_ranks, rank, buffer, group,
               num_tokens=args.num_tokens, hidden=args.hidden,
               num_topk=args.num_topk, num_experts=args.num_experts)
+
+    # Handle parity test: re-register for BF16 and use a separate unregistered buffer for reference
+    config = deep_ep.Config(num_sms, 8, 256)
+    buffer.register_direct_write_layout(args.num_tokens * args.num_processes, args.hidden, args.num_topk, 0, 2, config=config)
+    buffer_std = deep_ep.Buffer(group, num_nvl_bytes)
+    test_handle_parity(num_sms, local_rank, num_ranks, rank, buffer, buffer_std, group, config,
+                       num_tokens=args.num_tokens, hidden=args.hidden,
+                       num_topk=args.num_topk, num_experts=args.num_experts)
 
     if local_rank == 0:
         print('Success!', flush=True)
@@ -287,7 +367,7 @@ if __name__ == '__main__':
     parser.add_argument('--num-topk', type=int, default=8)
     parser.add_argument('--num-experts', type=int, default=256)
     parser.add_argument('--num-sms', type=int, default=20)
-    parser.add_argument('--buffer-size', type=int, default=512, help='NVL buffer size in MiB')
+    parser.add_argument('--buffer-size', type=int, default=1024, help='NVL buffer size in MiB')
     parser.add_argument('--num-processes', type=int, default=8)
     args = parser.parse_args()
 

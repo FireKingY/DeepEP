@@ -910,24 +910,43 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
     return {recv_x, recv_topk_weights, event};
 }
 
-void Buffer::register_direct_write_layout(int num_worst_tokens, int hidden, int num_topk, int num_scales, int elem_size, int num_channels) {
+void Buffer::register_direct_write_layout(int num_worst_tokens, int hidden, int num_topk, int num_scales,
+                                           int elem_size, int num_channels, int num_max_nvl_chunked_recv_tokens) {
     EP_HOST_ASSERT(num_worst_tokens > 0);
     EP_HOST_ASSERT(hidden > 0);
     EP_HOST_ASSERT(elem_size == 1 or elem_size == 2);  // FP8 or BF16
     EP_HOST_ASSERT(num_channels > 0);
+    EP_HOST_ASSERT(num_max_nvl_chunked_recv_tokens > 0);
 
     int hidden_int4 = hidden * elem_size / sizeof(int4);
     EP_HOST_ASSERT(hidden_int4 > 0);
 
-    // Compute Region B layout: all output tensors packed sequentially
-    // Region A is: rank_prefix_matrix (num_ranks * num_ranks * sizeof(int))
-    //            + expert metadata (num_ranks * num_local_experts * sizeof(int))
-    // We place Region B after the maximum possible Region A size
-    int64_t region_a_size = num_ranks * num_ranks * sizeof(int) + num_ranks * NUM_MAX_LOCAL_EXPERTS * sizeof(int);
-    // Align to 128 bytes
-    region_a_size = (region_a_size + NUM_BUFFER_ALIGNMENT_BYTES - 1) / NUM_BUFFER_ALIGNMENT_BYTES * NUM_BUFFER_ALIGNMENT_BYTES;
+    // Compute the standard dispatch scratch footprint (used by the ring-buffer path and combine)
+    // This is the space that standard dispatch and combine use from offset 0 in the IPC buffer.
+    // dispatch: rank_prefix_matrix + expert_meta + 4*channel_meta + ring_buffer(x, src_idx, topk_idx, topk_weights, scales)
+    int64_t dispatch_scratch =
+        static_cast<int64_t>(num_ranks) * num_ranks * sizeof(int) +                                  // rank_prefix_matrix
+        static_cast<int64_t>(num_ranks) * NUM_MAX_LOCAL_EXPERTS * sizeof(int) +                       // expert metadata
+        static_cast<int64_t>(num_channels) * num_ranks * sizeof(int) * 4 +                            // start/end/head/tail
+        static_cast<int64_t>(num_channels) * num_ranks * num_max_nvl_chunked_recv_tokens * hidden * elem_size + // x_buffers
+        static_cast<int64_t>(num_channels) * num_ranks * num_max_nvl_chunked_recv_tokens * sizeof(int) + // src_idx
+        static_cast<int64_t>(num_channels) * num_ranks * num_max_nvl_chunked_recv_tokens * num_topk * sizeof(topk_idx_t) + // topk_idx
+        static_cast<int64_t>(num_channels) * num_ranks * num_max_nvl_chunked_recv_tokens * num_topk * sizeof(float) + // topk_weights
+        static_cast<int64_t>(num_channels) * num_ranks * num_max_nvl_chunked_recv_tokens * num_scales * sizeof(float); // scales
 
-    int64_t offset = region_a_size;
+    // combine: head/tail + ring_buffer(x, src_idx, topk_weights)
+    int64_t combine_scratch =
+        static_cast<int64_t>(num_channels) * num_ranks * sizeof(int) * 2 +                            // head/tail
+        static_cast<int64_t>(num_channels) * num_ranks * num_max_nvl_chunked_recv_tokens * hidden * elem_size + // x_buffers
+        static_cast<int64_t>(num_channels) * num_ranks * num_max_nvl_chunked_recv_tokens * sizeof(int) + // src_idx
+        static_cast<int64_t>(num_channels) * num_ranks * num_max_nvl_chunked_recv_tokens * num_topk * sizeof(float); // topk_weights
+
+    // Region B must start after both dispatch and combine scratch to be disjoint
+    int64_t region_b_start = std::max(dispatch_scratch, combine_scratch);
+    region_b_start = (region_b_start + NUM_BUFFER_ALIGNMENT_BYTES - 1) / NUM_BUFFER_ALIGNMENT_BYTES * NUM_BUFFER_ALIGNMENT_BYTES;
+
+    // Compute Region B layout: all output tensors packed sequentially
+    int64_t offset = region_b_start;
 
     dw_recv_x_offset = offset;
     offset += static_cast<int64_t>(num_worst_tokens) * hidden * elem_size;
@@ -953,18 +972,11 @@ void Buffer::register_direct_write_layout(int num_worst_tokens, int hidden, int 
     offset += static_cast<int64_t>(num_ranks) * num_channels * sizeof(int);
     offset = (offset + NUM_BUFFER_ALIGNMENT_BYTES - 1) / NUM_BUFFER_ALIGNMENT_BYTES * NUM_BUFFER_ALIGNMENT_BYTES;
 
-    dw_region_b_size = offset - region_a_size;
+    dw_region_b_size = offset - region_b_start;
 
-    // Validate Region B (direct-write outputs) fits within num_nvl_bytes
+    // Validate total fits within num_nvl_bytes
     EP_HOST_ASSERT(offset <= num_nvl_bytes &&
-        "IPC buffer too small for direct-write output region. Increase num_nvl_bytes.");
-
-    // Also validate that combine scratch (Region C) fits within num_nvl_bytes.
-    // Region B and C are used sequentially (dispatch writes B, then combine uses C after clearing),
-    // so they share the same buffer space. Both must individually fit.
-    // Combine scratch layout: head/tail (2 * num_channels * num_ranks * int) + data + src_idx + topk_weights
-    // We use a conservative estimate with the registered parameters.
-    // The actual combine config may differ, but the assertion in combine() will catch that at runtime.
+        "IPC buffer too small for direct-write region + combine scratch. Increase num_nvl_bytes.");
 
     dw_num_worst_tokens = num_worst_tokens;
     dw_hidden = hidden;
@@ -1105,10 +1117,8 @@ Buffer::intranode_dispatch_direct_write(const torch::Tensor& x,
     auto recv_channel_prefix_matrix = torch::empty({num_ranks, num_channels}, torch::dtype(torch::kInt32).device(torch::kCUDA));
     auto recv_src_idx = torch::empty({num_recv_tokens}, torch::dtype(torch::kInt32).device(torch::kCUDA));
 
-    // Launch direct-write dispatch kernel
+    // Launch direct-write dispatch kernel (includes cross-rank barrier at the end)
     intranode::dispatch_direct_write(
-        recv_src_idx.data_ptr<int>(),
-        recv_channel_prefix_matrix.data_ptr<int>(),
         send_head.data_ptr<int>(),
         x.data_ptr(),
         x_scales_ptr,
@@ -1138,12 +1148,17 @@ Buffer::intranode_dispatch_direct_write(const torch::Tensor& x,
         dw_recv_channel_offset_offset,
         dw_elem_size);
 
-    // Copy recv_channel_prefix_matrix from local IPC slab into the output tensor
-    // The kernel wrote these values to each rank's IPC buffer; now copy from our own
+    // After the barrier, all NVLink writes from all ranks are visible.
+    // Copy handle metadata from local IPC slab into regular output tensors.
     CUDA_CHECK(cudaMemcpyAsync(
         recv_channel_prefix_matrix.data_ptr<int>(),
         static_cast<uint8_t*>(buffer_ptrs[nvl_rank]) + dw_recv_channel_offset_offset,
         num_ranks * num_channels * sizeof(int),
+        cudaMemcpyDeviceToDevice, comm_stream));
+    CUDA_CHECK(cudaMemcpyAsync(
+        recv_src_idx.data_ptr<int>(),
+        static_cast<uint8_t*>(buffer_ptrs[nvl_rank]) + dw_recv_src_idx_offset,
+        num_recv_tokens * sizeof(int),
         cudaMemcpyDeviceToDevice, comm_stream));
 
     // Create output tensor views from local IPC buffer
@@ -2152,7 +2167,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              py::arg("num_max_rdma_chunked_recv_tokens") = 256)
         .def("get_nvl_buffer_size_hint", &deep_ep::Config::get_nvl_buffer_size_hint)
         .def("get_rdma_buffer_size_hint", &deep_ep::Config::get_rdma_buffer_size_hint)
-        .def_readonly("num_sms", &deep_ep::Config::num_sms);
+        .def_readonly("num_sms", &deep_ep::Config::num_sms)
+        .def_readonly("num_max_nvl_chunked_recv_tokens", &deep_ep::Config::num_max_nvl_chunked_recv_tokens);
     m.def("get_low_latency_rdma_size_hint", &deep_ep::get_low_latency_rdma_size_hint);
 
     pybind11::class_<deep_ep::EventHandle>(m, "EventHandle")

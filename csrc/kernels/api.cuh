@@ -104,9 +104,7 @@ void dispatch(void* recv_x,
               int num_max_send_tokens,
               int num_recv_buffer_tokens);
 
-void dispatch_direct_write(int* recv_src_idx,
-                           int* recv_channel_offset,
-                           int* send_head,
+void dispatch_direct_write(int* send_head,
                            const void* x,
                            const float* x_scales,
                            const topk_idx_t* topk_idx,
