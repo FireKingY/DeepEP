@@ -262,19 +262,18 @@ def test_main(num_sms: int, local_rank: int, num_ranks: int, rank: int, buffer: 
     if local_rank == 0:
         print(' passed', flush=True)
 
-    # Test: mismatched hidden size should fail dispatch
+    # Test: mismatched hidden size falls back to standard ring-buffer dispatch
     if local_rank == 0:
-        print('[testing] Mismatched hidden size at dispatch ...', flush=True, end='')
+        print('[testing] Mismatched hidden size falls back to standard path ...', flush=True, end='')
     wrong_hidden = hidden // 2
     x_wrong = torch.randn((num_tokens, wrong_hidden), dtype=torch.bfloat16, device='cuda')
-    try:
-        buffer.dispatch(x=x_wrong, num_tokens_per_rank=num_tokens_per_rank,
-                        is_token_in_rank=is_token_in_rank, num_tokens_per_expert=num_tokens_per_expert,
-                        topk_idx=topk_idx, topk_weights=topk_weights,
-                        config=config, num_worst_tokens=num_worst_tokens)
-        assert False, 'Should have raised assertion error for mismatched hidden'
-    except RuntimeError:
-        pass
+    # With layout mismatch, Python routing falls back to standard dispatch (no crash)
+    result = buffer.dispatch(x=x_wrong, num_tokens_per_rank=num_tokens_per_rank,
+                             is_token_in_rank=is_token_in_rank, num_tokens_per_expert=num_tokens_per_expert,
+                             topk_idx=topk_idx, topk_weights=topk_weights,
+                             config=config, num_worst_tokens=num_worst_tokens)
+    # Standard path with num_worst_tokens returns worst-case size
+    assert result[0].size(0) == num_worst_tokens, 'Mismatched layout should use standard path'
     if local_rank == 0:
         print(' passed', flush=True)
 

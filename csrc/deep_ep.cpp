@@ -1002,6 +1002,10 @@ int Buffer::get_last_dispatch_grid_size() const {
     return last_dispatch_grid_size;
 }
 
+std::tuple<int, int, int, int, int, int> Buffer::get_direct_write_layout() const {
+    return {dw_num_worst_tokens, dw_hidden, dw_num_topk, dw_elem_size, dw_num_channels, dw_num_max_nvl_chunked_recv_tokens};
+}
+
 std::tuple<torch::Tensor,
            std::optional<torch::Tensor>,
            std::optional<torch::Tensor>,
@@ -1048,6 +1052,11 @@ Buffer::intranode_dispatch_direct_write(const torch::Tensor& x,
     EP_HOST_ASSERT((x.size(1) * x.element_size()) % sizeof(int4) == 0);
     EP_HOST_ASSERT(is_token_in_rank.dim() == 2 and is_token_in_rank.is_contiguous());
     EP_HOST_ASSERT(is_token_in_rank.size(0) == x.size(0) and is_token_in_rank.size(1) == num_ranks);
+    EP_HOST_ASSERT(num_tokens_per_expert->dim() == 1 and num_tokens_per_expert->is_contiguous());
+    EP_HOST_ASSERT(num_tokens_per_expert->size(0) % num_ranks == 0);
+    EP_HOST_ASSERT(num_tokens_per_expert->size(0) / num_ranks <= NUM_MAX_LOCAL_EXPERTS);
+    EP_HOST_ASSERT(num_tokens_per_rank->dim() == 1 and num_tokens_per_rank->is_contiguous());
+    EP_HOST_ASSERT(num_tokens_per_rank->size(0) == num_ranks);
 
     auto num_tokens = static_cast<int>(x.size(0)), hidden = static_cast<int>(x.size(1));
     auto num_experts = static_cast<int>(num_tokens_per_expert->size(0));
@@ -1065,6 +1074,9 @@ Buffer::intranode_dispatch_direct_write(const torch::Tensor& x,
         EP_HOST_ASSERT(num_topk == dw_num_topk);
         EP_HOST_ASSERT(topk_idx->dim() == 2 and topk_idx->is_contiguous());
         EP_HOST_ASSERT(topk_weights->dim() == 2 and topk_weights->is_contiguous());
+        EP_HOST_ASSERT(num_tokens == topk_idx->size(0) and num_tokens == topk_weights->size(0));
+        EP_HOST_ASSERT(num_topk == topk_weights->size(1));
+        EP_HOST_ASSERT(topk_weights->scalar_type() == torch::kFloat32);
         topk_idx_ptr = topk_idx->data_ptr<topk_idx_t>();
         topk_weights_ptr = topk_weights->data_ptr<float>();
     }
@@ -2222,6 +2234,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("register_direct_write_layout", &deep_ep::Buffer::register_direct_write_layout)
         .def("is_direct_write_registered", &deep_ep::Buffer::is_direct_write_registered)
         .def("get_last_dispatch_grid_size", &deep_ep::Buffer::get_last_dispatch_grid_size)
+        .def("get_direct_write_layout", &deep_ep::Buffer::get_direct_write_layout)
         .def("intranode_combine", &deep_ep::Buffer::intranode_combine)
         .def("internode_dispatch", &deep_ep::Buffer::internode_dispatch)
         .def("internode_combine", &deep_ep::Buffer::internode_combine)

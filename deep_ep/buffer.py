@@ -176,6 +176,16 @@ class Buffer:
         """Check if direct-write layout has been registered."""
         return self.runtime.is_direct_write_registered()
 
+    def _direct_write_layout_matches(self, x, topk_idx, num_worst_tokens, config) -> bool:
+        """Check if the current dispatch parameters match the registered direct-write layout."""
+        dw_worst, dw_hidden, dw_topk, dw_elem, dw_ch, dw_recv = self.runtime.get_direct_write_layout()
+        return (x.size(1) == dw_hidden
+                and x.element_size() == dw_elem
+                and num_worst_tokens == dw_worst
+                and topk_idx.size(1) == dw_topk
+                and config.num_sms // 2 == dw_ch
+                and config.num_max_nvl_chunked_recv_tokens == dw_recv)
+
     @staticmethod
     def is_sm90_compiled():
         return deep_ep_cpp.is_sm90_compiled()
@@ -418,8 +428,9 @@ class Buffer:
                 x, x_scales, None, None, None, is_token_in_rank, None, num_recv_tokens, rank_prefix_matrix, channel_prefix_matrix,
                 expert_alignment, num_worst_tokens, config, getattr(previous_event, 'event', None), async_finish, allocate_on_comm_stream)
             return (recv_x, recv_x_scales) if x_scales is not None else recv_x, None, None, None, None, EventOverlap(event)
-        elif num_worst_tokens > 0 and self.runtime.is_direct_write_registered() and topk_idx is not None:
-            # Direct-write path: sender writes directly to receiver's IPC buffer
+        elif (num_worst_tokens > 0 and self.runtime.is_direct_write_registered() and topk_idx is not None
+              and self._direct_write_layout_matches(x, topk_idx, num_worst_tokens, config)):
+            # Direct-write path: layout matches registration, use optimized path
             assert num_tokens_per_rank is not None and is_token_in_rank is not None and num_tokens_per_expert is not None
             recv_x, recv_x_scales, recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert_list, rank_prefix_matrix, channel_prefix_matrix, recv_channel_prefix_matrix, recv_src_idx, send_head, event = \
                 self.runtime.intranode_dispatch_direct_write(x, x_scales, topk_idx, topk_weights,
