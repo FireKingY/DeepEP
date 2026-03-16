@@ -1,4 +1,6 @@
 import argparse
+import os
+import sys
 import torch
 import torch.distributed as dist
 
@@ -313,13 +315,22 @@ def test_main(num_sms: int, local_rank: int, num_ranks: int, rank: int, buffer: 
     if local_rank == 0:
         print(' passed', flush=True)
 
-    # Test: send_head is critical for combine correctness
-    # We verify this by showing that valid handle produces correct combine output (already tested above)
-    # and that the handle parity test proves send_head must be exact.
-    # Note: corrupting send_head with arbitrary values causes combine kernel timeout+trap
-    # (deterministic failure by design), which kills the CUDA context and cannot be tested in-process.
-    # The combine round-trip tests above already prove that correct send_head → correct combine,
-    # and the handle parity test proves direct-write send_head exactly matches standard dispatch.
+    # Test: corrupted send_head causes deterministic failure (subprocess test)
+    if local_rank == 0:
+        print('[testing] Corrupted send_head causes process crash (subprocess) ...', flush=True, end='')
+    if local_rank == 0:
+        import subprocess
+        helper = os.path.join(os.path.dirname(__file__), '_corrupt_send_head_helper.py')
+        env = os.environ.copy()
+        env['MASTER_PORT'] = '8399'  # Use different port to avoid conflict
+        result = subprocess.run(
+            [sys.executable, helper],
+            env=env, timeout=120, capture_output=True, text=True)
+        # The helper should exit with non-zero (trap kills the process)
+        assert result.returncode != 0, \
+            f'Corrupted send_head should crash, but process exited with 0. stderr: {result.stderr[:500]}'
+        print(' passed', flush=True)
+    group.barrier()
 
     if local_rank == 0:
         print('\n=== All Direct-Write Dispatch Tests Passed ===\n', flush=True)
