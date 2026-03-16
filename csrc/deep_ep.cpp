@@ -865,10 +865,6 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
         static_cast<int64_t>(num_channels) * num_ranks * config.num_max_nvl_chunked_recv_tokens * sizeof(int) +
         static_cast<int64_t>(num_channels) * num_ranks * config.num_max_nvl_chunked_recv_tokens * num_topk * sizeof(float);
     EP_HOST_ASSERT(combine_scratch_bytes <= num_nvl_bytes);
-    if (last_dispatch_was_direct_write) {
-        EP_HOST_ASSERT(combine_scratch_bytes <= dw_recv_x_offset &&
-            "Combine scratch overlaps direct-write Region B. Use a matching config or re-register.");
-    }
     intranode::combine(at::cuda::ScalarTypeToCudaDataType(x.scalar_type()),
                        recv_x.data_ptr(),
                        recv_topk_weights_ptr,
@@ -1089,6 +1085,7 @@ Buffer::intranode_dispatch_direct_write(const torch::Tensor& x,
         EP_HOST_ASSERT(x.element_size() == 1);
         EP_HOST_ASSERT(x_scales->scalar_type() == torch::kFloat32 or x_scales->scalar_type() == torch::kInt);
         EP_HOST_ASSERT(x_scales->dim() == 2);
+        EP_HOST_ASSERT(x_scales->size(0) == num_tokens && "x_scales row count must match x row count");
         num_scales = x_scales->dim() == 1 ? 1 : static_cast<int>(x_scales->size(1));
         EP_HOST_ASSERT(num_scales == dw_num_scales && "FP8 scale count does not match registered layout");
         x_scales_ptr = static_cast<float*>(x_scales->data_ptr());
