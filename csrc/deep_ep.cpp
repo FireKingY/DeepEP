@@ -2212,6 +2212,39 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def_readonly("num_sms", &deep_ep::Config::num_sms)
         .def_readonly("num_max_nvl_chunked_recv_tokens", &deep_ep::Config::num_max_nvl_chunked_recv_tokens);
     m.def("get_low_latency_rdma_size_hint", &deep_ep::get_low_latency_rdma_size_hint);
+    m.def("get_direct_write_nvl_size_hint", [](int num_worst_tokens, int hidden, int num_topk, int num_scales,
+                                                int elem_size, int num_ranks, const deep_ep::Config& config) -> int64_t {
+        // Compute the total NVL buffer size needed for direct-write dispatch.
+        // This includes the standard dispatch/combine scratch plus Region B.
+        int num_channels = config.num_sms / 2;
+        int worst_case_elem_size = std::max(elem_size, 2);
+        int64_t dispatch_scratch =
+            static_cast<int64_t>(num_ranks) * num_ranks * sizeof(int) +
+            static_cast<int64_t>(num_ranks) * NUM_MAX_LOCAL_EXPERTS * sizeof(int) +
+            static_cast<int64_t>(num_channels) * num_ranks * sizeof(int) * 4 +
+            static_cast<int64_t>(num_channels) * num_ranks * config.num_max_nvl_chunked_recv_tokens * hidden * worst_case_elem_size +
+            static_cast<int64_t>(num_channels) * num_ranks * config.num_max_nvl_chunked_recv_tokens * sizeof(int) +
+            static_cast<int64_t>(num_channels) * num_ranks * config.num_max_nvl_chunked_recv_tokens * num_topk * sizeof(deep_ep::topk_idx_t) +
+            static_cast<int64_t>(num_channels) * num_ranks * config.num_max_nvl_chunked_recv_tokens * num_topk * sizeof(float) +
+            static_cast<int64_t>(num_channels) * num_ranks * config.num_max_nvl_chunked_recv_tokens * num_scales * sizeof(float);
+        int64_t combine_scratch =
+            static_cast<int64_t>(num_channels) * num_ranks * sizeof(int) * 2 +
+            static_cast<int64_t>(num_channels) * num_ranks * config.num_max_nvl_chunked_recv_tokens * hidden * worst_case_elem_size +
+            static_cast<int64_t>(num_channels) * num_ranks * config.num_max_nvl_chunked_recv_tokens * sizeof(int) +
+            static_cast<int64_t>(num_channels) * num_ranks * config.num_max_nvl_chunked_recv_tokens * num_topk * sizeof(float);
+        int64_t region_b_start = std::max(dispatch_scratch, combine_scratch);
+        region_b_start = (region_b_start + NUM_BUFFER_ALIGNMENT_BYTES - 1) / NUM_BUFFER_ALIGNMENT_BYTES * NUM_BUFFER_ALIGNMENT_BYTES;
+        // Region B: recv_x + topk_idx + topk_weights + src_idx + scales + channel_offset
+        int64_t region_b =
+            static_cast<int64_t>(num_worst_tokens) * hidden * elem_size +
+            static_cast<int64_t>(num_worst_tokens) * num_topk * sizeof(deep_ep::topk_idx_t) +
+            static_cast<int64_t>(num_worst_tokens) * num_topk * sizeof(float) +
+            static_cast<int64_t>(num_worst_tokens) * sizeof(int) +
+            static_cast<int64_t>(num_worst_tokens) * num_scales * sizeof(float) +
+            static_cast<int64_t>(num_ranks) * num_channels * sizeof(int);
+        region_b = (region_b + NUM_BUFFER_ALIGNMENT_BYTES - 1) / NUM_BUFFER_ALIGNMENT_BYTES * NUM_BUFFER_ALIGNMENT_BYTES;
+        return region_b_start + region_b;
+    });
 
     pybind11::class_<deep_ep::EventHandle>(m, "EventHandle")
         .def(pybind11::init<>())

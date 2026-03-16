@@ -421,8 +421,13 @@ def main(args: argparse.Namespace, local_rank: int, num_ranks: int, rank: int):
 
     num_sms = args.num_sms if args.num_sms > 0 else 20
 
-    # Use larger buffer to accommodate disjoint direct-write region
-    num_nvl_bytes = int(args.buffer_size * 1024 * 1024)
+    # Compute buffer size: max of standard hint and direct-write hint
+    config = deep_ep.Config(num_sms, 8, 256)
+    num_worst_tokens = args.num_tokens * args.num_processes
+    std_hint = config.get_nvl_buffer_size_hint(args.hidden * 2, args.num_processes)
+    dw_hint = deep_ep.get_direct_write_nvl_size_hint(
+        num_worst_tokens, args.hidden, args.num_topk, 0, 2, args.num_processes, config)
+    num_nvl_bytes = max(int(args.buffer_size * 1024 * 1024), max(std_hint, dw_hint))
     buffer = deep_ep.Buffer(group, num_nvl_bytes)
 
     test_main(num_sms, local_rank, num_ranks, rank, buffer, group,
