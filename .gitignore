@@ -9,3 +9,8 @@ build/
 *.so
 results/
 .humanize*
+draft_plan.md
+intranode_sender_dma_draft.md
+intranode_sender_dma_plan.md
+resarch.md
+wait_idel.plan
