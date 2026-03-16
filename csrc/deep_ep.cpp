@@ -1175,27 +1175,41 @@ Buffer::intranode_dispatch_direct_write(const torch::Tensor& x,
         num_recv_tokens * sizeof(int),
         cudaMemcpyDeviceToDevice, comm_stream));
 
-    // Create output tensor views from local IPC buffer
-    auto recv_x = torch::from_blob(
+    // Create owned output tensors by copying from the IPC buffer.
+    // This ensures outputs are independent of the Buffer's IPC slab lifetime
+    // and are safe across multiple dispatches (no aliasing).
+    auto recv_x = torch::empty({num_recv_tokens, hidden}, x.options());
+    CUDA_CHECK(cudaMemcpyAsync(
+        recv_x.data_ptr(),
         static_cast<uint8_t*>(buffer_ptrs[nvl_rank]) + dw_recv_x_offset,
-        {num_recv_tokens, hidden}, x.options());
+        static_cast<int64_t>(num_recv_tokens) * hidden * x.element_size(),
+        cudaMemcpyDeviceToDevice, comm_stream));
 
     auto recv_topk_idx = std::optional<torch::Tensor>();
     auto recv_topk_weights_out = std::optional<torch::Tensor>();
     auto recv_x_scales_out = std::optional<torch::Tensor>();
 
     if (topk_idx.has_value()) {
-        recv_topk_idx = torch::from_blob(
+        recv_topk_idx = torch::empty({num_recv_tokens, num_topk}, topk_idx->options());
+        CUDA_CHECK(cudaMemcpyAsync(
+            recv_topk_idx->data_ptr(),
             static_cast<uint8_t*>(buffer_ptrs[nvl_rank]) + dw_recv_topk_idx_offset,
-            {num_recv_tokens, num_topk}, topk_idx->options());
-        recv_topk_weights_out = torch::from_blob(
+            static_cast<int64_t>(num_recv_tokens) * num_topk * sizeof(topk_idx_t),
+            cudaMemcpyDeviceToDevice, comm_stream));
+        recv_topk_weights_out = torch::empty({num_recv_tokens, num_topk}, topk_weights->options());
+        CUDA_CHECK(cudaMemcpyAsync(
+            recv_topk_weights_out->data_ptr(),
             static_cast<uint8_t*>(buffer_ptrs[nvl_rank]) + dw_recv_topk_weights_offset,
-            {num_recv_tokens, num_topk}, topk_weights->options());
+            static_cast<int64_t>(num_recv_tokens) * num_topk * sizeof(float),
+            cudaMemcpyDeviceToDevice, comm_stream));
     }
     if (x_scales.has_value()) {
-        recv_x_scales_out = torch::from_blob(
+        recv_x_scales_out = torch::empty({num_recv_tokens, num_scales}, x_scales->options());
+        CUDA_CHECK(cudaMemcpyAsync(
+            recv_x_scales_out->data_ptr(),
             static_cast<uint8_t*>(buffer_ptrs[nvl_rank]) + dw_recv_x_scales_offset,
-            {num_recv_tokens, num_scales}, x_scales->options());
+            static_cast<int64_t>(num_recv_tokens) * num_scales * sizeof(float),
+            cudaMemcpyDeviceToDevice, comm_stream));
     }
 
     // Wait streams
