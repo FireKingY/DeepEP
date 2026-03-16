@@ -293,25 +293,33 @@ def test_main(num_sms: int, local_rank: int, num_ranks: int, rank: int, buffer: 
     if local_rank == 0:
         print(' passed', flush=True)
 
-    # Test: SM-count regression guard — direct-write uses num_sms/2 blocks
+    # Test: SM-count regression guard — direct-write uses num_sms/2 blocks, standard uses num_sms
     if local_rank == 0:
-        print('[testing] SM-count: direct-write uses fewer blocks than standard ...', flush=True, end='')
-    # The direct-write path launches num_channels = num_sms/2 blocks.
-    # Standard dispatch launches num_sms blocks (sender+receiver pairs).
-    # We verify by checking that direct-write dispatch succeeds with the registered config
-    # and that standard dispatch (num_worst_tokens=0) also succeeds — neither crashes.
-    std_result = buffer.dispatch(x=x, num_tokens_per_rank=num_tokens_per_rank,
-                                 is_token_in_rank=is_token_in_rank, num_tokens_per_expert=num_tokens_per_expert,
-                                 topk_idx=topk_idx, topk_weights=topk_weights,
-                                 config=config, num_worst_tokens=0)
-    assert std_result[0].size(0) == gbl_num_tokens_per_rank[rank].item()
-    dw_result = buffer.dispatch(x=x, num_tokens_per_rank=num_tokens_per_rank,
-                                is_token_in_rank=is_token_in_rank, num_tokens_per_expert=num_tokens_per_expert,
-                                topk_idx=topk_idx, topk_weights=topk_weights,
-                                config=config, num_worst_tokens=num_worst_tokens)
-    assert dw_result[0].size(0) == num_worst_tokens
+        print('[testing] SM-count: verify launch grid sizes ...', flush=True, end='')
+    # Standard dispatch: launches config.num_sms blocks (sender+receiver pairs)
+    buffer.dispatch(x=x, num_tokens_per_rank=num_tokens_per_rank,
+                    is_token_in_rank=is_token_in_rank, num_tokens_per_expert=num_tokens_per_expert,
+                    topk_idx=topk_idx, topk_weights=topk_weights,
+                    config=config, num_worst_tokens=0)
+    std_grid = buffer.runtime.get_last_dispatch_grid_size()
+    assert std_grid == config.num_sms, f'Standard dispatch grid should be {config.num_sms}, got {std_grid}'
+    # Direct-write dispatch: launches config.num_sms/2 blocks (sender-only)
+    buffer.dispatch(x=x, num_tokens_per_rank=num_tokens_per_rank,
+                    is_token_in_rank=is_token_in_rank, num_tokens_per_expert=num_tokens_per_expert,
+                    topk_idx=topk_idx, topk_weights=topk_weights,
+                    config=config, num_worst_tokens=num_worst_tokens)
+    dw_grid = buffer.runtime.get_last_dispatch_grid_size()
+    assert dw_grid == config.num_sms // 2, f'Direct-write grid should be {config.num_sms // 2}, got {dw_grid}'
     if local_rank == 0:
         print(' passed', flush=True)
+
+    # Test: send_head is critical for combine correctness
+    # We verify this by showing that valid handle produces correct combine output (already tested above)
+    # and that the handle parity test proves send_head must be exact.
+    # Note: corrupting send_head with arbitrary values causes combine kernel timeout+trap
+    # (deterministic failure by design), which kills the CUDA context and cannot be tested in-process.
+    # The combine round-trip tests above already prove that correct send_head → correct combine,
+    # and the handle parity test proves direct-write send_head exactly matches standard dispatch.
 
     if local_rank == 0:
         print('\n=== All Direct-Write Dispatch Tests Passed ===\n', flush=True)

@@ -688,6 +688,7 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
             num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * num_topk * sizeof(float) +        // Top-k weight buffer
             num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * sizeof(float) * num_scales        // FP8 scale buffer
         <= num_nvl_bytes);
+    last_dispatch_grid_size = config.num_sms;
     intranode::dispatch(recv_x.data_ptr(),
                         recv_x_scales_ptr,
                         recv_src_idx.data_ptr<int>(),
@@ -997,6 +998,10 @@ bool Buffer::is_direct_write_registered() const {
     return direct_write_registered;
 }
 
+int Buffer::get_last_dispatch_grid_size() const {
+    return last_dispatch_grid_size;
+}
+
 std::tuple<torch::Tensor,
            std::optional<torch::Tensor>,
            std::optional<torch::Tensor>,
@@ -1126,6 +1131,7 @@ Buffer::intranode_dispatch_direct_write(const torch::Tensor& x,
     auto recv_src_idx = torch::empty({num_recv_tokens}, torch::dtype(torch::kInt32).device(torch::kCUDA));
 
     // Launch direct-write dispatch kernel (includes cross-rank barrier at the end)
+    last_dispatch_grid_size = num_channels;  // sender-only: num_sms / 2
     intranode::dispatch_direct_write(
         send_head.data_ptr<int>(),
         x.data_ptr(),
@@ -2201,6 +2207,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("intranode_dispatch_direct_write", &deep_ep::Buffer::intranode_dispatch_direct_write)
         .def("register_direct_write_layout", &deep_ep::Buffer::register_direct_write_layout)
         .def("is_direct_write_registered", &deep_ep::Buffer::is_direct_write_registered)
+        .def("get_last_dispatch_grid_size", &deep_ep::Buffer::get_last_dispatch_grid_size)
         .def("intranode_combine", &deep_ep::Buffer::intranode_combine)
         .def("internode_dispatch", &deep_ep::Buffer::internode_dispatch)
         .def("internode_combine", &deep_ep::Buffer::internode_combine)

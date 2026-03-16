@@ -129,6 +129,9 @@ private:
     int dw_num_channels = 0;
     int dw_num_max_nvl_chunked_recv_tokens = 0;
 
+    // Debug: last intranode dispatch grid size (for testing SM-count regression)
+    int last_dispatch_grid_size = 0;
+
 public:
     Buffer(int rank,
            int num_ranks,
@@ -272,6 +275,8 @@ public:
     void register_direct_write_layout(int num_worst_tokens, int hidden, int num_topk, int num_scales, int elem_size, int num_channels, int num_max_nvl_chunked_recv_tokens);
 
     bool is_direct_write_registered() const;
+
+    int get_last_dispatch_grid_size() const;
 
     std::tuple<torch::Tensor,
                std::optional<torch::Tensor>,
