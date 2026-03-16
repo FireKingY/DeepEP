@@ -1002,8 +1002,8 @@ int Buffer::get_last_dispatch_grid_size() const {
     return last_dispatch_grid_size;
 }
 
-std::tuple<int, int, int, int, int, int> Buffer::get_direct_write_layout() const {
-    return {dw_num_worst_tokens, dw_hidden, dw_num_topk, dw_elem_size, dw_num_channels, dw_num_max_nvl_chunked_recv_tokens};
+std::tuple<int, int, int, int, int, int, int> Buffer::get_direct_write_layout() const {
+    return {dw_num_worst_tokens, dw_hidden, dw_num_topk, dw_elem_size, dw_num_channels, dw_num_max_nvl_chunked_recv_tokens, dw_num_scales};
 }
 
 std::tuple<torch::Tensor,

@@ -322,6 +322,7 @@ def test_main(num_sms: int, local_rank: int, num_ranks: int, rank: int, buffer: 
         helper = os.path.join(os.path.dirname(os.path.abspath(__file__)), '_corrupt_send_head_helper.py')
         env = os.environ.copy()
         env['MASTER_PORT'] = '8399'  # Use different port to avoid conflict
+        env['NUM_PROCESSES'] = str(num_ranks)
         env['PYTHONPATH'] = os.path.dirname(os.path.dirname(os.path.abspath(__file__))) + \
             ((':' + env['PYTHONPATH']) if 'PYTHONPATH' in env else '')
         result = subprocess.run(

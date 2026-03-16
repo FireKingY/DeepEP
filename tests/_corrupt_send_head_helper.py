@@ -20,7 +20,7 @@ import torch
 import deep_ep
 from utils import init_dist, inplace_unique
 
-_NUM_PROCESSES = 8
+_NUM_PROCESSES = int(os.environ.get('NUM_PROCESSES', '8'))
 
 
 def run(local_rank):

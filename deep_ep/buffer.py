@@ -176,15 +176,17 @@ class Buffer:
         """Check if direct-write layout has been registered."""
         return self.runtime.is_direct_write_registered()
 
-    def _direct_write_layout_matches(self, x, topk_idx, num_worst_tokens, config) -> bool:
+    def _direct_write_layout_matches(self, x, x_scales, topk_idx, num_worst_tokens, config) -> bool:
         """Check if the current dispatch parameters match the registered direct-write layout."""
         if config.num_sms % 2 != 0:
             return False  # Odd num_sms is invalid for dispatch/combine
-        dw_worst, dw_hidden, dw_topk, dw_elem, dw_ch, dw_recv = self.runtime.get_direct_write_layout()
+        dw_worst, dw_hidden, dw_topk, dw_elem, dw_ch, dw_recv, dw_scales = self.runtime.get_direct_write_layout()
+        num_scales = 0 if x_scales is None else (1 if x_scales.dim() == 1 else x_scales.size(1))
         return (x.size(1) == dw_hidden
                 and x.element_size() == dw_elem
                 and num_worst_tokens == dw_worst
                 and topk_idx.size(1) == dw_topk
+                and num_scales == dw_scales
                 and config.num_sms // 2 == dw_ch
                 and config.num_max_nvl_chunked_recv_tokens == dw_recv)
 
@@ -431,7 +433,7 @@ class Buffer:
                 expert_alignment, num_worst_tokens, config, getattr(previous_event, 'event', None), async_finish, allocate_on_comm_stream)
             return (recv_x, recv_x_scales) if x_scales is not None else recv_x, None, None, None, None, EventOverlap(event)
         elif (num_worst_tokens > 0 and self.runtime.is_direct_write_registered() and topk_idx is not None
-              and self._direct_write_layout_matches(x, topk_idx, num_worst_tokens, config)):
+              and self._direct_write_layout_matches(x, x_scales, topk_idx, num_worst_tokens, config)):
             # Direct-write path: layout matches registration, use optimized path
             assert num_tokens_per_rank is not None and is_token_in_rank is not None and num_tokens_per_expert is not None
             recv_x, recv_x_scales, recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert_list, rank_prefix_matrix, channel_prefix_matrix, recv_channel_prefix_matrix, recv_src_idx, send_head, event = \

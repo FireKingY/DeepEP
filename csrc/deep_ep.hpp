@@ -281,7 +281,7 @@ public:
 
     int get_last_dispatch_grid_size() const;
 
-    std::tuple<int, int, int, int, int, int> get_direct_write_layout() const;
+    std::tuple<int, int, int, int, int, int, int> get_direct_write_layout() const;
 
     std::tuple<torch::Tensor,
                std::optional<torch::Tensor>,
