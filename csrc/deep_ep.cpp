@@ -925,22 +925,25 @@ void Buffer::register_direct_write_layout(int num_worst_tokens, int hidden, int 
     EP_HOST_ASSERT(hidden_int4 > 0);
 
     // Compute the standard dispatch scratch footprint (used by the ring-buffer path and combine)
-    // This is the space that standard dispatch and combine use from offset 0 in the IPC buffer.
+    // Use BF16 element size (2) as worst case for x_buffers, since combine always operates on BF16
+    // even when dispatch used FP8. This ensures Region B is placed after the largest possible scratch.
+    int worst_case_elem_size = std::max(elem_size, 2);
+
     // dispatch: rank_prefix_matrix + expert_meta + 4*channel_meta + ring_buffer(x, src_idx, topk_idx, topk_weights, scales)
     int64_t dispatch_scratch =
         static_cast<int64_t>(num_ranks) * num_ranks * sizeof(int) +                                  // rank_prefix_matrix
         static_cast<int64_t>(num_ranks) * NUM_MAX_LOCAL_EXPERTS * sizeof(int) +                       // expert metadata
         static_cast<int64_t>(num_channels) * num_ranks * sizeof(int) * 4 +                            // start/end/head/tail
-        static_cast<int64_t>(num_channels) * num_ranks * num_max_nvl_chunked_recv_tokens * hidden * elem_size + // x_buffers
+        static_cast<int64_t>(num_channels) * num_ranks * num_max_nvl_chunked_recv_tokens * hidden * worst_case_elem_size + // x_buffers
         static_cast<int64_t>(num_channels) * num_ranks * num_max_nvl_chunked_recv_tokens * sizeof(int) + // src_idx
         static_cast<int64_t>(num_channels) * num_ranks * num_max_nvl_chunked_recv_tokens * num_topk * sizeof(topk_idx_t) + // topk_idx
         static_cast<int64_t>(num_channels) * num_ranks * num_max_nvl_chunked_recv_tokens * num_topk * sizeof(float) + // topk_weights
         static_cast<int64_t>(num_channels) * num_ranks * num_max_nvl_chunked_recv_tokens * num_scales * sizeof(float); // scales
 
-    // combine: head/tail + ring_buffer(x, src_idx, topk_weights)
+    // combine: head/tail + ring_buffer(x, src_idx, topk_weights) — always BF16 for x_buffers
     int64_t combine_scratch =
         static_cast<int64_t>(num_channels) * num_ranks * sizeof(int) * 2 +                            // head/tail
-        static_cast<int64_t>(num_channels) * num_ranks * num_max_nvl_chunked_recv_tokens * hidden * elem_size + // x_buffers
+        static_cast<int64_t>(num_channels) * num_ranks * num_max_nvl_chunked_recv_tokens * hidden * worst_case_elem_size + // x_buffers
         static_cast<int64_t>(num_channels) * num_ranks * num_max_nvl_chunked_recv_tokens * sizeof(int) + // src_idx
         static_cast<int64_t>(num_channels) * num_ranks * num_max_nvl_chunked_recv_tokens * num_topk * sizeof(float); // topk_weights
 
