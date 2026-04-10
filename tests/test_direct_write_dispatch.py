@@ -1,5 +1,6 @@
 import argparse
 import os
+import subprocess
 import sys
 import torch
 import torch.distributed as dist
@@ -7,6 +8,31 @@ import torch.distributed as dist
 # noinspection PyUnresolvedReferences
 import deep_ep
 from utils import init_dist, calc_diff, inplace_unique, per_token_cast_to_fp8, per_token_cast_back
+
+
+def run_corrupted_send_head_subprocess(num_processes: int):
+    print('[testing] Corrupted send_head causes process crash (subprocess) ...', flush=True, end='')
+
+    helper = os.path.join(os.path.dirname(os.path.abspath(__file__)), '_corrupt_send_head_helper.py')
+    env = os.environ.copy()
+    env['MASTER_PORT'] = '8399'  # Use different port to avoid conflict
+    env['NUM_PROCESSES'] = str(num_processes)
+    env['PYTHONPATH'] = os.path.dirname(os.path.dirname(os.path.abspath(__file__))) + \
+        ((':' + env['PYTHONPATH']) if 'PYTHONPATH' in env else '')
+    result = subprocess.run([sys.executable, helper], env=env, timeout=300, capture_output=True, text=True)
+    combined_output = result.stdout + result.stderr
+
+    # 1. Verify the helper reached the corrupted combine call (not a bootstrap failure)
+    assert 'REACHED_CORRUPTED_COMBINE' in combined_output, \
+        f'Helper did not reach corrupted combine path. Bootstrap failure?\n' \
+        f'returncode={result.returncode}\nstdout: {result.stdout[:1000]}\nstderr: {result.stderr[:1000]}'
+    # 2. Verify the process crashed (non-zero exit from kernel trap/timeout)
+    assert result.returncode != 0, \
+        f'Corrupted send_head should crash, but process exited with 0.\nstdout: {result.stdout[:500]}\nstderr: {result.stderr[:500]}'
+    # 3. Verify it was not a silent success (no "ERROR: combine did not fail" message)
+    assert 'ERROR: combine did not fail' not in combined_output, \
+        'Helper reached past combine without crashing — send_head corruption was not detected'
+    print(' passed', flush=True)
 
 
 def test_main(num_sms: int, local_rank: int, num_ranks: int, rank: int, buffer: deep_ep.Buffer,
@@ -314,34 +340,6 @@ def test_main(num_sms: int, local_rank: int, num_ranks: int, rank: int, buffer: 
     if local_rank == 0:
         print(' passed', flush=True)
 
-    # Test: corrupted send_head causes deterministic failure (subprocess test)
-    if local_rank == 0:
-        print('[testing] Corrupted send_head causes process crash (subprocess) ...', flush=True, end='')
-    if local_rank == 0:
-        import subprocess
-        helper = os.path.join(os.path.dirname(os.path.abspath(__file__)), '_corrupt_send_head_helper.py')
-        env = os.environ.copy()
-        env['MASTER_PORT'] = '8399'  # Use different port to avoid conflict
-        env['NUM_PROCESSES'] = str(num_ranks)
-        env['PYTHONPATH'] = os.path.dirname(os.path.dirname(os.path.abspath(__file__))) + \
-            ((':' + env['PYTHONPATH']) if 'PYTHONPATH' in env else '')
-        result = subprocess.run(
-            [sys.executable, helper],
-            env=env, timeout=180, capture_output=True, text=True)
-        combined_output = result.stdout + result.stderr
-        # 1. Verify the helper reached the corrupted combine call (not a bootstrap failure)
-        assert 'REACHED_CORRUPTED_COMBINE' in combined_output, \
-            f'Helper did not reach corrupted combine path. Bootstrap failure?\n' \
-            f'returncode={result.returncode}\nstderr: {result.stderr[:1000]}'
-        # 2. Verify the process crashed (non-zero exit from kernel trap/timeout)
-        assert result.returncode != 0, \
-            f'Corrupted send_head should crash, but process exited with 0.\nstderr: {result.stderr[:500]}'
-        # 3. Verify it was not a silent success (no "ERROR: combine did not fail" message)
-        assert 'ERROR: combine did not fail' not in combined_output, \
-            'Helper reached past combine without crashing — send_head corruption was not detected'
-        print(' passed', flush=True)
-    group.barrier()
-
     if local_rank == 0:
         print('\n=== All Direct-Write Dispatch Tests Passed ===\n', flush=True)
 
@@ -445,6 +443,8 @@ def main(args: argparse.Namespace, local_rank: int, num_ranks: int, rank: int):
     if local_rank == 0:
         print('Success!', flush=True)
 
+    dist.destroy_process_group()
+
 
 def spawn_main(local_rank, args):
     main(args, local_rank, args.num_processes, local_rank)
@@ -462,3 +462,4 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     torch.multiprocessing.spawn(spawn_main, args=(args,), nprocs=args.num_processes)
+    run_corrupted_send_head_subprocess(args.num_processes)

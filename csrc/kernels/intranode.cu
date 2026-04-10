@@ -612,7 +612,7 @@ void dispatch(void* recv_x,
 
 // Direct-write dispatch: sender writes directly to receiver's IPC buffer output region.
 // No receiver SMs needed. Only used when num_worst_tokens > 0 and layout is registered.
-template <int kNumRanks, int kNumThreads>
+template <int kNumRanks, int kNumThreads, int kNumTMABytesPerWarp>
 __global__ void __launch_bounds__(kNumThreads, 1) dispatch_direct_write(
         int* send_head,
         const int4* x,
@@ -640,6 +640,20 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch_direct_write(
         int elem_size) {
     const auto num_sms = static_cast<int>(gridDim.x), sm_id = static_cast<int>(blockIdx.x);
     const auto thread_id = static_cast<int>(threadIdx.x), lane_id = get_lane_id();
+
+#ifndef DISABLE_SM90_FEATURES
+    extern __shared__ __align__(1024) uint8_t smem_buffer[];
+    constexpr int kNumTMABatchInt4 = (kNumTMABytesPerWarp - sizeof(uint64_t)) / sizeof(int4);
+    EP_STATIC_ASSERT(kNumTMABatchInt4 > 0, "Invalid TMA batch size");
+    auto tma_buffer = smem_buffer + (thread_id / 32) * kNumTMABytesPerWarp;
+    auto tma_mbarrier = reinterpret_cast<uint64_t*>(tma_buffer + kNumTMABatchInt4 * static_cast<int>(sizeof(int4)));
+    uint32_t tma_phase = 0;
+    if (elect_one_sync()) {
+        mbarrier_init(tma_mbarrier, 1);
+        fence_barrier_init();
+    }
+    __syncwarp();
+#endif
 
     // All SMs are senders (no receiver SMs needed)
     constexpr int num_send_warps = kNumThreads / 32;
@@ -707,7 +721,24 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch_direct_write(
             // Copy x data
             auto dst_x_int4 = reinterpret_cast<int4*>(dst_recv_x_base + static_cast<int64_t>(dst_offset) * hidden_int4 * sizeof(int4));
             auto src_x_int4 = x + token_idx * hidden_int4;
+#ifndef DISABLE_SM90_FEATURES
+            for (int i = 0; i < hidden_int4; i += kNumTMABatchInt4) {
+                auto tma_int4 = min(kNumTMABatchInt4, hidden_int4 - i);
+                auto tma_bytes = tma_int4 * static_cast<int>(sizeof(int4));
+                tma_store_wait<0>();
+                if (elect_one_sync()) {
+                    tma_load_1d(tma_buffer, src_x_int4 + i, tma_mbarrier, tma_bytes);
+                    mbarrier_arrive_and_expect_tx(tma_mbarrier, tma_bytes);
+                }
+                __syncwarp();
+                mbarrier_wait(tma_mbarrier, tma_phase);
+                if (elect_one_sync())
+                    tma_store_1d(tma_buffer, dst_x_int4 + i, tma_bytes, false);
+                __syncwarp();
+            }
+#else
             UNROLLED_WARP_COPY(5, lane_id, hidden_int4, dst_x_int4, src_x_int4, __ldg, st_na_global);
+#endif
 
             // Copy source index
             if (elect_one_sync())
@@ -780,6 +811,10 @@ void dispatch_direct_write(int* send_head,
                            int64_t recv_channel_offset_offset,
                            int elem_size) {
     constexpr int kNumThreads = 768;
+    constexpr int kNumTMABytesPerWarp = 8192;
+#ifndef DISABLE_SM90_FEATURES
+    constexpr int smem_size = kNumTMABytesPerWarp * (kNumThreads / 32);
+#endif
 
     // Make sure never OOB
     EP_HOST_ASSERT(static_cast<int64_t>(num_scales) * scale_hidden_stride < std::numeric_limits<int>::max());
@@ -789,33 +824,37 @@ void dispatch_direct_write(int* send_head,
     int num_channels = num_sms / 2;  // Use half the configured SMs as channels
     EP_HOST_ASSERT(num_channels > 0);
 
-#define DW_DISPATCH_LAUNCH_CASE(ranks)                                              \
-    LAUNCH_KERNEL(&cfg,                                                             \
-                  dispatch_direct_write<ranks, kNumThreads>,                        \
-                  send_head,                                                        \
-                  reinterpret_cast<const int4*>(x),                                 \
-                  x_scales,                                                         \
-                  topk_idx,                                                         \
-                  topk_weights,                                                     \
-                  is_token_in_rank,                                                 \
-                  channel_prefix_matrix,                                            \
-                  num_tokens,                                                       \
-                  num_worst_tokens,                                                 \
-                  hidden_int4,                                                      \
-                  num_topk,                                                         \
-                  num_experts,                                                      \
-                  num_scales,                                                       \
-                  scale_token_stride,                                               \
-                  scale_hidden_stride,                                              \
-                  buffer_ptrs,                                                      \
-                  rank,                                                             \
-                  recv_x_offset,                                                    \
-                  recv_topk_idx_offset,                                             \
-                  recv_topk_weights_offset,                                         \
-                  recv_src_idx_offset,                                              \
-                  recv_x_scales_offset,                                             \
-                  recv_channel_offset_offset,                                       \
-                  elem_size);                                                       \
+#define DW_DISPATCH_LAUNCH_CASE(ranks)                                                 \
+    {                                                                                  \
+        auto kernel = dispatch_direct_write<ranks, kNumThreads, kNumTMABytesPerWarp>; \
+        SET_SHARED_MEMORY_FOR_TMA(kernel);                                             \
+        LAUNCH_KERNEL(&cfg,                                                            \
+                      kernel,                                                          \
+                      send_head,                                                       \
+                      reinterpret_cast<const int4*>(x),                                \
+                      x_scales,                                                        \
+                      topk_idx,                                                        \
+                      topk_weights,                                                    \
+                      is_token_in_rank,                                                \
+                      channel_prefix_matrix,                                           \
+                      num_tokens,                                                      \
+                      num_worst_tokens,                                                \
+                      hidden_int4,                                                     \
+                      num_topk,                                                        \
+                      num_experts,                                                     \
+                      num_scales,                                                      \
+                      scale_token_stride,                                              \
+                      scale_hidden_stride,                                             \
+                      buffer_ptrs,                                                     \
+                      rank,                                                            \
+                      recv_x_offset,                                                   \
+                      recv_topk_idx_offset,                                            \
+                      recv_topk_weights_offset,                                        \
+                      recv_src_idx_offset,                                             \
+                      recv_x_scales_offset,                                            \
+                      recv_channel_offset_offset,                                      \
+                      elem_size);                                                      \
+    }                                                                                  \
     break
 
     SETUP_LAUNCH_CONFIG(num_channels, kNumThreads, stream);
